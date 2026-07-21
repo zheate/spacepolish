@@ -3,17 +3,17 @@ set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
 PROJECT_DIR="${SCRIPT_DIR:h}"
-APP_DIR="$PROJECT_DIR/dist/SpacePolish.app"
+APP_DIR="$PROJECT_DIR/dist/Pole.app"
 CONTENTS_DIR="$APP_DIR/Contents"
-SIGNING_IDENTITY="${SPACEPOLISH_CODESIGN_IDENTITY:-}"
+SIGNING_IDENTITY="${POLE_CODESIGN_IDENTITY:-${SPACEPOLISH_CODESIGN_IDENTITY:-}}"
 
 cd "$PROJECT_DIR"
 swift build -c release
 
 mkdir -p "$CONTENTS_DIR/MacOS" "$CONTENTS_DIR/Resources"
-cp "$PROJECT_DIR/.build/release/SpacePolish" "$CONTENTS_DIR/MacOS/SpacePolish"
+cp "$PROJECT_DIR/.build/release/Pole" "$CONTENTS_DIR/MacOS/Pole"
 cp "$PROJECT_DIR/Resources/Info.plist" "$CONTENTS_DIR/Info.plist"
-cp "$PROJECT_DIR/Resources/SpacePolish.icns" "$CONTENTS_DIR/Resources/SpacePolish.icns"
+cp "$PROJECT_DIR/Resources/Pole.icns" "$CONTENTS_DIR/Resources/Pole.icns"
 
 if [[ -z "$SIGNING_IDENTITY" ]]; then
     SIGNING_IDENTITY="$(

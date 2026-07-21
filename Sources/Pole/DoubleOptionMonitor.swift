@@ -186,6 +186,6 @@ enum MonitorError: LocalizedError {
     case cannotCreateEventTap
 
     var errorDescription: String? {
-        "无法监听键盘。请在系统设置中授予 SpacePolish 辅助功能权限，然后重新打开应用。"
+        "无法监听键盘。请在系统设置中授予 Pole 辅助功能权限，然后重新打开应用。"
     }
 }

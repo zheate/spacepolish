@@ -607,7 +607,7 @@ private enum KeyboardTextFallback {
         defer { try? collapseSelectionToEnd(processIdentifier: processIdentifier) }
         wait(0.06)
 
-        let marker = "SpacePolish-\(UUID().uuidString)"
+        let marker = "Pole-\(UUID().uuidString)"
         pasteboard.clearContents()
         pasteboard.setString(marker, forType: .string)
         let markerChangeCount = pasteboard.changeCount

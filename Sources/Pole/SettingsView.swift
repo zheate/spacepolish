@@ -23,7 +23,7 @@ final class SettingsWindowController: NSWindowController {
             backing: .buffered,
             defer: false
         )
-        window.title = "SpacePolish 设置"
+        window.title = "Pole 设置"
         window.isReleasedWhenClosed = false
         window.contentMinSize = NSSize(width: 540, height: 520)
         super.init(window: window)
@@ -62,7 +62,7 @@ final class SettingsWindowController: NSWindowController {
             stack.bottomAnchor.constraint(lessThanOrEqualTo: root.bottomAnchor, constant: -20)
         ])
 
-        let title = NSTextField(labelWithString: "SpacePolish")
+        let title = NSTextField(labelWithString: "Pole")
         title.font = .systemFont(ofSize: 24, weight: .semibold)
         let subtitle = NSTextField(labelWithString: "左 Option 连按两次润色，右 Option 连按两次翻译。")
         subtitle.textColor = .secondaryLabelColor

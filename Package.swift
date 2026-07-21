@@ -3,17 +3,17 @@
 import PackageDescription
 
 let package = Package(
-    name: "SpacePolish",
+    name: "Pole",
     platforms: [
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "SpacePolish", targets: ["SpacePolish"])
+        .executable(name: "Pole", targets: ["Pole"])
     ],
     targets: [
         .executableTarget(
-            name: "SpacePolish",
-            path: "Sources/SpacePolish",
+            name: "Pole",
+            path: "Sources/Pole",
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("ApplicationServices"),

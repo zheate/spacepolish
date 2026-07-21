@@ -31,7 +31,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
 
         statusItem.button?.image = NSImage(
             systemSymbolName: "wand.and.stars",
-            accessibilityDescription: "SpacePolish"
+            accessibilityDescription: "Pole"
         )
         let menu = NSMenu()
         menu.delegate = self
@@ -105,7 +105,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
-        let quit = NSMenuItem(title: "退出 SpacePolish", action: #selector(quitApp), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "退出 Pole", action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
     }
@@ -130,7 +130,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     @objc private func requestPermission() {
         AccessibilityPermission.request()
         AccessibilityPermission.openSystemSettings()
-        model.statusText = "授权后请切回 SpacePolish"
+        model.statusText = "授权后请切回 Pole"
     }
 
     @objc private func applicationDidBecomeActive() {

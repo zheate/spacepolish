@@ -1,6 +1,6 @@
 import AppKit
 
-final class SpacePolishAppDelegate: NSObject, NSApplicationDelegate {
+final class PoleAppDelegate: NSObject, NSApplicationDelegate {
     private var coordinator: AppCoordinator?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -10,7 +10,7 @@ final class SpacePolishAppDelegate: NSObject, NSApplicationDelegate {
 }
 
 let app = NSApplication.shared
-let delegate = SpacePolishAppDelegate()
+let delegate = PoleAppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
 app.run()

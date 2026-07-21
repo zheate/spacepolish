@@ -1,4 +1,4 @@
-# SpacePolish Settings Design QA
+# Pole Settings Design QA
 
 - Source visual truth: `/Users/zh/Documents/test/spacepolish/work/qa/spacepolish-settings-broken.png`
 - Implementation screenshot: `/Users/zh/Documents/test/spacepolish/work/qa/spacepolish-settings-fixed.jpeg`
