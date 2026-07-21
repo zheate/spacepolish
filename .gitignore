@@ -2,3 +2,14 @@
 .build/
 dist/
 work/
+
+# Local packaging artifacts
+outputs/
+*.app/
+*.zip
+*.dmg
+*.pkg
+*.tar
+*.tar.gz
+*.tgz
+*.7z

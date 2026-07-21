@@ -10,45 +10,84 @@ struct TextRewritePlan: Equatable {
 }
 
 enum TextRangePlanner {
-    static func plan(text: String, cursorUTF16: Int) throws -> TextRewritePlan {
+    static func plan(text: String, selectedRange: NSRange) throws -> TextRewritePlan {
         let original = text as NSString
-        guard cursorUTF16 >= 0, cursorUTF16 <= original.length else {
+        guard selectedRange.location != NSNotFound,
+              selectedRange.location >= 0,
+              selectedRange.location <= original.length,
+              selectedRange.length >= 0,
+              selectedRange.length <= original.length - selectedRange.location else {
             throw TextEditingError.cursorUnavailable
         }
 
-        let prefixRange = NSRange(location: 0, length: cursorUTF16)
-        let lastNewline = original.range(
-            of: "\n",
-            options: .backwards,
-            range: prefixRange
-        )
-        let paragraphStart = lastNewline.location == NSNotFound
-            ? 0
-            : lastNewline.location + lastNewline.length
-
-        let paragraphRange = NSRange(
-            location: paragraphStart,
-            length: cursorUTF16 - paragraphStart
-        )
-        let paragraph = original.substring(with: paragraphRange) as NSString
+        let replacementRange = selectedRange.length > 0
+            ? selectedRange
+            : NSRange(location: 0, length: original.length)
+        let source = original.substring(with: replacementRange)
         let nonWhitespace = CharacterSet.whitespacesAndNewlines.inverted
-        let first = paragraph.rangeOfCharacter(from: nonWhitespace)
-        guard first.location != NSNotFound else {
+        guard (source as NSString).rangeOfCharacter(from: nonWhitespace).location != NSNotFound else {
             throw TextEditingError.noTextToOptimize
         }
-        let last = paragraph.rangeOfCharacter(from: nonWhitespace, options: .backwards)
 
-        let replacementRange = NSRange(
-            location: paragraphStart + first.location,
-            length: last.location + last.length - first.location
-        )
-        let source = original.substring(with: replacementRange)
         return TextRewritePlan(
             capturedText: text,
-            cursorUTF16: cursorUTF16,
+            cursorUTF16: NSMaxRange(selectedRange),
             replacementRange: replacementRange,
             sourceText: source
         )
+    }
+}
+
+enum TextSelectionResolver {
+    static func resolve(
+        text: String,
+        copiedSelection: String?,
+        accessibilityRange: NSRange?
+    ) throws -> NSRange {
+        let original = text as NSString
+
+        if let accessibilityRange,
+           isValid(accessibilityRange, forUTF16Length: original.length) {
+            if accessibilityRange.length == 0 {
+                if copiedSelection == nil || copiedSelection?.isEmpty == true {
+                    return accessibilityRange
+                }
+            } else {
+                let rangedText = original.substring(with: accessibilityRange)
+                if copiedSelection == nil || copiedSelection == rangedText {
+                    return accessibilityRange
+                }
+            }
+        }
+
+        guard let copiedSelection, !copiedSelection.isEmpty else {
+            return NSRange(location: original.length, length: 0)
+        }
+
+        let first = original.range(of: copiedSelection)
+        guard first.location != NSNotFound else {
+            throw TextEditingError.selectionUnavailable
+        }
+
+        let nextStart = first.location + 1
+        if nextStart <= original.length {
+            let second = original.range(
+                of: copiedSelection,
+                range: NSRange(location: nextStart, length: original.length - nextStart)
+            )
+            guard second.location == NSNotFound else {
+                throw TextEditingError.selectionUnavailable
+            }
+        }
+        return first
+    }
+
+    private static func isValid(_ range: NSRange, forUTF16Length length: Int) -> Bool {
+        range.location != NSNotFound
+            && range.location >= 0
+            && range.location <= length
+            && range.length >= 0
+            && range.length <= length - range.location
     }
 }
 
@@ -155,8 +194,147 @@ final class CapturedTextContext {
     }
 }
 
+private enum AccessibilityCaretLocator {
+    static func screenRect(
+        on element: AXUIElement,
+        preferredLocation: Int? = nil,
+        fallbackLocation: Int? = nil
+    ) -> CGRect? {
+        let location: Int
+        if let preferredLocation {
+            location = preferredLocation
+        } else if let selectedRange = selectedTextRange(on: element) {
+            location = selectedRange.location + selectedRange.length
+        } else if let fallbackLocation {
+            location = fallbackLocation
+        } else {
+            return nil
+        }
+
+        guard location >= 0 else { return nil }
+
+        if let caretRect = bounds(
+            for: CFRange(location: location, length: 0),
+            on: element
+        ) {
+            return insertionRect(at: caretRect.minX, matching: caretRect)
+        }
+
+        // The character after the insertion point gives the correct leading edge,
+        // including when the caret is at the beginning of a wrapped line.
+        for length in [1, 2] {
+            if let followingRect = bounds(
+                for: CFRange(location: location, length: length),
+                on: element
+            ) {
+                return insertionRect(at: followingRect.minX, matching: followingRect)
+            }
+        }
+
+        // At the end of the text there is no following character. Try both one and
+        // two UTF-16 code units so emoji and other surrogate pairs still resolve.
+        for length in [1, 2] where location >= length {
+            if let precedingRect = bounds(
+                for: CFRange(location: location - length, length: length),
+                on: element
+            ) {
+                return insertionRect(at: precedingRect.maxX, matching: precedingRect)
+            }
+        }
+
+        return nil
+    }
+
+    static func focusedScreenRect(
+        processIdentifier: pid_t,
+        preferredLocation: Int? = nil,
+        fallbackLocation: Int? = nil
+    ) -> CGRect? {
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            systemWide,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedRef
+        ) == .success,
+              let focusedRef else {
+            return nil
+        }
+
+        let focusedElement = focusedRef as! AXUIElement
+        var focusedProcessIdentifier: pid_t = 0
+        guard AXUIElementGetPid(
+            focusedElement,
+            &focusedProcessIdentifier
+        ) == .success,
+              focusedProcessIdentifier == processIdentifier else {
+            return nil
+        }
+
+        return screenRect(
+            on: focusedElement,
+            preferredLocation: preferredLocation,
+            fallbackLocation: fallbackLocation
+        )
+    }
+
+    private static func selectedTextRange(on element: AXUIElement) -> CFRange? {
+        var rangeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element,
+            kAXSelectedTextRangeAttribute as CFString,
+            &rangeRef
+        ) == .success,
+              let rangeRef else {
+            return nil
+        }
+
+        let rangeValue = rangeRef as! AXValue
+        var range = CFRange()
+        guard AXValueGetType(rangeValue) == .cfRange,
+              AXValueGetValue(rangeValue, .cfRange, &range) else {
+            return nil
+        }
+        return range
+    }
+
+    private static func bounds(
+        for range: CFRange,
+        on element: AXUIElement
+    ) -> CGRect? {
+        var mutableRange = range
+        guard let rangeValue = AXValueCreate(.cfRange, &mutableRange) else {
+            return nil
+        }
+
+        var boundsRef: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(
+            element,
+            kAXBoundsForRangeParameterizedAttribute as CFString,
+            rangeValue,
+            &boundsRef
+        ) == .success,
+              let boundsRef else {
+            return nil
+        }
+
+        let boundsValue = boundsRef as! AXValue
+        var rect = CGRect.zero
+        guard AXValueGetType(boundsValue) == .cgRect,
+              AXValueGetValue(boundsValue, .cgRect, &rect),
+              rect.height > 0 else {
+            return nil
+        }
+        return rect
+    }
+
+    private static func insertionRect(at x: CGFloat, matching rect: CGRect) -> CGRect {
+        CGRect(x: x, y: rect.minY, width: 1, height: rect.height)
+    }
+}
+
 struct AccessibilityTextService {
-    func captureCurrentParagraph() throws -> CapturedTextContext {
+    func captureTargetText() throws -> CapturedTextContext {
         do {
             return try captureUsingAccessibility()
         } catch let error as TextEditingError {
@@ -166,7 +344,7 @@ struct AccessibilityTextService {
                   KeyboardTextFallback.supportsFrontmostApplication else {
                 throw error
             }
-            return try KeyboardTextFallback.captureCurrentParagraph()
+            return try KeyboardTextFallback.captureTargetText()
         }
     }
 
@@ -206,14 +384,16 @@ struct AccessibilityTextService {
         let axRange = rangeRef as! AXValue
         var selectedRange = CFRange()
         guard AXValueGetType(axRange) == .cfRange,
-              AXValueGetValue(axRange, .cfRange, &selectedRange),
-              selectedRange.length == 0 else {
+              AXValueGetValue(axRange, .cfRange, &selectedRange) else {
             throw TextEditingError.unsupportedTextField
         }
 
         let plan = try TextRangePlanner.plan(
             text: text,
-            cursorUTF16: selectedRange.location
+            selectedRange: NSRange(
+                location: selectedRange.location,
+                length: selectedRange.length
+            )
         )
 
         return CapturedTextContext(target: .accessibility(element), plan: plan)
@@ -271,38 +451,36 @@ struct AccessibilityTextService {
         )
     }
 
-    func insertionPointScreenRect(for context: CapturedTextContext) -> CGRect? {
-        guard case .accessibility(let element) = context.target else {
-            return KeyboardTextFallback.indicatorScreenRect(for: context.target)
-        }
+    func insertionPointScreenRect(
+        for context: CapturedTextContext,
+        cursorUTF16: Int? = nil
+    ) -> CGRect? {
+        switch context.target {
+        case .accessibility(let element):
+            if let rect = AccessibilityCaretLocator.screenRect(
+                on: element,
+                preferredLocation: cursorUTF16,
+                fallbackLocation: context.cursorUTF16
+            ) {
+                return rect
+            }
 
-        if let caretRect = bounds(
-            for: CFRange(location: context.cursorUTF16, length: 0),
-            on: element
-        ) {
-            return caretRect
-        }
-
-        if context.cursorUTF16 > 0,
-           let precedingCharacterRect = bounds(
-                for: CFRange(location: context.cursorUTF16 - 1, length: 1),
-                on: element
-           ) {
-            return CGRect(
-                x: precedingCharacterRect.maxX,
-                y: precedingCharacterRect.minY,
-                width: 1,
-                height: precedingCharacterRect.height
+            var processIdentifier: pid_t = 0
+            guard AXUIElementGetPid(element, &processIdentifier) == .success else {
+                return nil
+            }
+            return AccessibilityCaretLocator.focusedScreenRect(
+                processIdentifier: processIdentifier,
+                preferredLocation: cursorUTF16,
+                fallbackLocation: context.cursorUTF16
+            )
+        case .keyboard(let processIdentifier):
+            return AccessibilityCaretLocator.focusedScreenRect(
+                processIdentifier: processIdentifier,
+                preferredLocation: cursorUTF16,
+                fallbackLocation: context.cursorUTF16
             )
         }
-
-        guard let elementFrame = frame(of: element) else { return nil }
-        return CGRect(
-            x: max(elementFrame.minX, elementFrame.maxX - 42),
-            y: max(elementFrame.minY, elementFrame.maxY - 24),
-            width: 1,
-            height: min(20, elementFrame.height)
-        )
     }
 
     private func replaceCharacters(
@@ -347,66 +525,6 @@ struct AccessibilityTextService {
             on: element,
             range: CFRange(location: finalCursor, length: 0)
         )
-    }
-
-    private func bounds(for range: CFRange, on element: AXUIElement) -> CGRect? {
-        var mutableRange = range
-        guard let rangeValue = AXValueCreate(.cfRange, &mutableRange) else {
-            return nil
-        }
-
-        var boundsRef: CFTypeRef?
-        guard AXUIElementCopyParameterizedAttributeValue(
-            element,
-            kAXBoundsForRangeParameterizedAttribute as CFString,
-            rangeValue,
-            &boundsRef
-        ) == .success,
-              let boundsRef else {
-            return nil
-        }
-
-        let boundsValue = boundsRef as! AXValue
-        var rect = CGRect.zero
-        guard AXValueGetType(boundsValue) == .cgRect,
-              AXValueGetValue(boundsValue, .cgRect, &rect),
-              rect.height > 0 else {
-            return nil
-        }
-        return rect
-    }
-
-    private func frame(of element: AXUIElement) -> CGRect? {
-        var positionRef: CFTypeRef?
-        var sizeRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            element,
-            kAXPositionAttribute as CFString,
-            &positionRef
-        ) == .success,
-              AXUIElementCopyAttributeValue(
-                element,
-                kAXSizeAttribute as CFString,
-                &sizeRef
-              ) == .success,
-              let positionRef,
-              let sizeRef,
-              CFGetTypeID(positionRef) == AXValueGetTypeID(),
-              CFGetTypeID(sizeRef) == AXValueGetTypeID() else {
-            return nil
-        }
-        let positionValue = positionRef as! AXValue
-        let sizeValue = sizeRef as! AXValue
-
-        var position = CGPoint.zero
-        var size = CGSize.zero
-        guard AXValueGetValue(positionValue, .cgPoint, &position),
-              AXValueGetValue(sizeValue, .cgSize, &size),
-              size.width > 0,
-              size.height > 0 else {
-            return nil
-        }
-        return CGRect(origin: position, size: size)
     }
 
     private func scheduleCaretRecovery(
@@ -544,7 +662,7 @@ private enum KeyboardTextFallback {
         return KeyboardFallbackPolicy.allows(bundleIdentifier: bundleIdentifier)
     }
 
-    static func captureCurrentParagraph() throws -> CapturedTextContext {
+    static func captureTargetText() throws -> CapturedTextContext {
         guard let application = NSWorkspace.shared.frontmostApplication,
               let bundleIdentifier = application.bundleIdentifier,
               KeyboardFallbackPolicy.allows(bundleIdentifier: bundleIdentifier) else {
@@ -553,15 +671,99 @@ private enum KeyboardTextFallback {
         try TextInputSafety.validateFocusedElementIfAvailable()
 
         let processIdentifier = application.processIdentifier
+        let accessibilityRange = focusedSelectedRange(
+            processIdentifier: processIdentifier
+        )
+        let copiedSelection = try copyCurrentSelection(
+            processIdentifier: processIdentifier
+        )
         let text = try readAllText(processIdentifier: processIdentifier)
+        let selectedRange = try TextSelectionResolver.resolve(
+            text: text,
+            copiedSelection: copiedSelection,
+            accessibilityRange: accessibilityRange
+        )
         let plan = try TextRangePlanner.plan(
             text: text,
-            cursorUTF16: (text as NSString).length
+            selectedRange: selectedRange
         )
         return CapturedTextContext(
             target: .keyboard(processIdentifier: processIdentifier),
             plan: plan
         )
+    }
+
+    private static func copyCurrentSelection(processIdentifier: pid_t) throws -> String? {
+        try ensureFrontmost(processIdentifier)
+        let pasteboard = NSPasteboard.general
+        let snapshot = PasteboardSnapshot(pasteboard: pasteboard)
+        defer { snapshot.restore(to: pasteboard) }
+
+        let marker = "Pole-selection-\(UUID().uuidString)"
+        pasteboard.clearContents()
+        pasteboard.setString(marker, forType: .string)
+        let markerChangeCount = pasteboard.changeCount
+
+        try performShortcut(
+            keyCode: 8,
+            modifiers: .maskCommand,
+            processIdentifier: processIdentifier
+        )
+        guard waitForPasteboardChange(
+            pasteboard,
+            after: markerChangeCount,
+            timeout: 0.18
+        ),
+              let selection = pasteboard.string(forType: .string),
+              selection != marker,
+              !selection.isEmpty else {
+            return nil
+        }
+        return selection
+    }
+
+    private static func focusedSelectedRange(processIdentifier: pid_t) -> NSRange? {
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            systemWide,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedRef
+        ) == .success,
+              let focusedRef else {
+            return nil
+        }
+
+        let focusedElement = focusedRef as! AXUIElement
+        var focusedProcessIdentifier: pid_t = 0
+        guard AXUIElementGetPid(
+            focusedElement,
+            &focusedProcessIdentifier
+        ) == .success,
+              focusedProcessIdentifier == processIdentifier else {
+            return nil
+        }
+
+        var rangeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            focusedElement,
+            kAXSelectedTextRangeAttribute as CFString,
+            &rangeRef
+        ) == .success,
+              let rangeRef,
+              CFGetTypeID(rangeRef) == AXValueGetTypeID() else {
+            return nil
+        }
+
+        let rangeValue = rangeRef as! AXValue
+        var range = CFRange()
+        guard AXValueGetType(rangeValue) == .cfRange,
+              AXValueGetValue(rangeValue, .cfRange, &range),
+              range.location >= 0,
+              range.length >= 0 else {
+            return nil
+        }
+        return NSRange(location: range.location, length: range.length)
     }
 
     static func replace(
@@ -577,20 +779,6 @@ private enum KeyboardTextFallback {
             replacement: replacement
         )
         try pasteAllText(commit.updatedText, processIdentifier: processIdentifier)
-    }
-
-    static func indicatorScreenRect(for target: CapturedTextContext.Target) -> CGRect? {
-        guard case .keyboard(let processIdentifier) = target,
-              let windowBounds = frontmostWindowBounds(processIdentifier: processIdentifier) else {
-            return nil
-        }
-
-        return CGRect(
-            x: windowBounds.maxX - 92,
-            y: windowBounds.maxY - windowBounds.height * 0.28,
-            width: 1,
-            height: 20
-        )
     }
 
     private static func readAllText(processIdentifier: pid_t) throws -> String {
@@ -858,30 +1046,6 @@ private enum KeyboardTextFallback {
         Thread.sleep(forTimeInterval: duration)
     }
 
-    private static func frontmostWindowBounds(processIdentifier: pid_t) -> CGRect? {
-        guard let windowInfo = CGWindowListCopyWindowInfo(
-            [.optionOnScreenOnly, .excludeDesktopElements],
-            kCGNullWindowID
-        ) as? [[String: Any]] else {
-            return nil
-        }
-
-        for window in windowInfo {
-            guard window[kCGWindowOwnerPID as String] as? pid_t == processIdentifier,
-                  window[kCGWindowLayer as String] as? Int == 0,
-                  let boundsObject = window[kCGWindowBounds as String] else {
-                continue
-            }
-            let boundsDictionary = boundsObject as! CFDictionary
-            guard let bounds = CGRect(dictionaryRepresentation: boundsDictionary),
-                  bounds.width > 0,
-                  bounds.height > 0 else {
-                continue
-            }
-            return bounds
-        }
-        return nil
-    }
 }
 
 private struct PasteboardSnapshot {
@@ -922,6 +1086,7 @@ enum TextEditingError: LocalizedError, Equatable {
     case textChangedWhileWaiting
     case keyboardTextUnavailable
     case sensitiveTextField
+    case selectionUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -932,7 +1097,7 @@ enum TextEditingError: LocalizedError, Equatable {
         case .cursorUnavailable:
             return "无法确定当前输入光标的位置"
         case .noTextToOptimize:
-            return "当前段落没有可优化的文字"
+            return "当前输入框没有可优化的文字"
         case .readOnlyTextField:
             return "这个输入框不允许修改文本"
         case .cannotSetSelection:
@@ -942,9 +1107,11 @@ enum TextEditingError: LocalizedError, Equatable {
         case .textChangedWhileWaiting:
             return "等待 AI 时文本已被修改，因此没有覆盖你的新内容"
         case .keyboardTextUnavailable:
-            return "无法读取这个输入框，请确认光标位于文字末尾后重试"
+            return "无法读取这个输入框"
         case .sensitiveTextField:
             return "为了保护隐私，密码和安全输入框不会进行优化"
+        case .selectionUnavailable:
+            return "无法确定所选文字在输入框中的位置"
         }
     }
 }

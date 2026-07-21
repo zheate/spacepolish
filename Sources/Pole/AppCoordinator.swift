@@ -15,6 +15,13 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         }
     }
 
+    private struct PendingCompletion {
+        let context: CapturedTextContext
+        let cursorUTF16: Int
+        let outcome: OptimizationOutcome
+        let action: RewriteAction
+    }
+
     let model = AppModel()
 
     private let client = QwenClient()
@@ -25,6 +32,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private var settingsController: SettingsWindowController?
     private var isMonitorStarted = false
+    private var pendingCompletion: PendingCompletion?
 
     override init() {
         super.init()
@@ -174,17 +182,16 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
 
     private func handleTrigger(_ action: RewriteAction) {
         guard model.hasAPIKey else {
-            showError("请先在设置中填写通义千问 API Key")
-            openSettings()
+            model.statusText = model.isEnabled ? readyStatusText : "已暂停"
             return
         }
         guard !model.isProcessing else { return }
 
         let context: CapturedTextContext
         do {
-            context = try textService.captureCurrentParagraph()
+            context = try textService.captureTargetText()
         } catch {
-            showError(error.localizedDescription)
+            model.statusText = model.isEnabled ? readyStatusText : "已暂停"
             return
         }
 
@@ -212,28 +219,62 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         result: result
                     )
                     try self.textService.replace(context: context, with: result)
-                    self.inputProgressIndicator.finish(
-                        with: outcome,
-                        operation: action == .translate ? .translation : .optimization
+                    let finalCursorUTF16 = context.replacementRange.location
+                        + (result as NSString).length
+                    self.inputProgressIndicator.move(
+                        to: self.textService.insertionPointScreenRect(
+                            for: context,
+                            cursorUTF16: finalCursorUTF16
+                        )
                     )
+                    self.pendingCompletion = PendingCompletion(
+                        context: context,
+                        cursorUTF16: finalCursorUTF16,
+                        outcome: outcome,
+                        action: action
+                    )
+                    self.perform(
+                        #selector(self.finishPendingCompletion),
+                        with: nil,
+                        afterDelay: 0.06
+                    )
+                }
+            } catch {
+                await MainActor.run {
+                    NSObject.cancelPreviousPerformRequests(
+                        withTarget: self,
+                        selector: #selector(self.finishPendingCompletion),
+                        object: nil
+                    )
+                    self.pendingCompletion = nil
+                    self.inputProgressIndicator.hide()
                     self.model.isProcessing = false
                     self.model.statusText = self.model.isEnabled
                         ? self.readyStatusText
                         : "已暂停"
                 }
-            } catch {
-                await MainActor.run {
-                    self.inputProgressIndicator.fail()
-                    self.model.isProcessing = false
-                    self.showError(error.localizedDescription)
-                }
             }
         }
     }
 
+    @objc private func finishPendingCompletion() {
+        guard let completion = pendingCompletion, model.isProcessing else { return }
+        pendingCompletion = nil
+        inputProgressIndicator.move(
+            to: textService.insertionPointScreenRect(
+                for: completion.context,
+                cursorUTF16: completion.cursorUTF16
+            )
+        )
+        inputProgressIndicator.finish(
+            with: completion.outcome,
+            operation: completion.action == .translate ? .translation : .optimization
+        )
+        model.isProcessing = false
+        model.statusText = model.isEnabled ? readyStatusText : "已暂停"
+    }
+
     private func showError(_ message: String) {
         model.statusText = message
-        hud.show(message, isError: true, duration: 3.2)
-        NSSound.beep()
     }
 }

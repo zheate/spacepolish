@@ -6,10 +6,10 @@ enum InputProgressOperation {
 }
 
 final class InputProgressIndicator {
+    private static let caretHorizontalGap: CGFloat = 6
+
     private enum Timing {
-        static let entrance: TimeInterval = 0.14
         static let resultTransition: TimeInterval = 0.22
-        static let dismissal: TimeInterval = 0.14
     }
 
     private var panel: NSPanel?
@@ -19,21 +19,11 @@ final class InputProgressIndicator {
         hide()
 
         let indicatorSize = NSSize(width: 30, height: 18)
-        var origin = fallbackOrigin(indicatorSize: indicatorSize)
-        if let accessibilityScreenRect,
-           let primaryScreen = NSScreen.screens.first {
-            let caretRect = NSRect(
-                x: accessibilityScreenRect.minX,
-                y: primaryScreen.frame.maxY - accessibilityScreenRect.maxY,
-                width: accessibilityScreenRect.width,
-                height: accessibilityScreenRect.height
-            )
-            origin = NSPoint(
-                x: caretRect.maxX + 3,
-                y: caretRect.midY - indicatorSize.height / 2
-            )
-        }
-        origin = clampedOrigin(origin, indicatorSize: indicatorSize)
+        let initialOrigin = panelOrigin(
+            for: accessibilityScreenRect,
+            indicatorSize: indicatorSize
+        ) ?? fallbackOrigin(indicatorSize: indicatorSize)
+        let origin = clampedOrigin(initialOrigin, indicatorSize: indicatorSize)
 
         let reducesMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         let indicator = ProgressIndicatorView(
@@ -50,22 +40,29 @@ final class InputProgressIndicator {
         panel.setFrameOrigin(origin)
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = true
+        panel.hasShadow = false
         panel.level = .statusBar
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.ignoresMouseEvents = true
         panel.hidesOnDeactivate = false
-        panel.alphaValue = 0
 
         self.panel = panel
         panel.orderFrontRegardless()
         indicator.showProcessing()
+    }
 
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = Timing.entrance
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            panel.animator().alphaValue = 1
+    func move(to accessibilityScreenRect: CGRect?) {
+        guard let panel,
+              let accessibilityScreenRect,
+              let origin = panelOrigin(
+                for: accessibilityScreenRect,
+                indicatorSize: panel.frame.size
+              ) else {
+            return
         }
+        panel.setFrameOrigin(
+            clampedOrigin(origin, indicatorSize: panel.frame.size)
+        )
     }
 
     func finish(
@@ -121,15 +118,9 @@ final class InputProgressIndicator {
         guard let panel else { return }
 
         (panel.contentView as? ProgressIndicatorView)?.stopAnimating()
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = Timing.dismissal
-            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
-            panel.animator().alphaValue = 0
-        } completionHandler: { [weak self, weak panel] in
-            panel?.orderOut(nil)
-            if let panel, self?.panel === panel {
-                self?.panel = nil
-            }
+        panel.orderOut(nil)
+        if self.panel === panel {
+            self.panel = nil
         }
     }
 
@@ -138,6 +129,26 @@ final class InputProgressIndicator {
         return NSPoint(
             x: mouse.x + 8,
             y: mouse.y - indicatorSize.height / 2
+        )
+    }
+
+    private func panelOrigin(
+        for accessibilityScreenRect: CGRect?,
+        indicatorSize: NSSize
+    ) -> NSPoint? {
+        guard let accessibilityScreenRect,
+              let primaryScreen = NSScreen.screens.first else {
+            return nil
+        }
+        let caretRect = NSRect(
+            x: accessibilityScreenRect.minX,
+            y: primaryScreen.frame.maxY - accessibilityScreenRect.maxY,
+            width: accessibilityScreenRect.width,
+            height: accessibilityScreenRect.height
+        )
+        return NSPoint(
+            x: caretRect.maxX + Self.caretHorizontalGap,
+            y: caretRect.midY - indicatorSize.height / 2
         )
     }
 
@@ -185,7 +196,7 @@ private enum IndicatorVisualState {
         case .changed:
             return .systemGreen
         case .unchanged:
-            return NSColor.white.withAlphaComponent(0.72)
+            return NSColor(calibratedWhite: 0.82, alpha: 1)
         case .failed:
             return .systemRed
         }
@@ -219,7 +230,7 @@ private final class ProgressIndicatorView: NSView {
         super.init(frame: frameRect)
 
         wantsLayer = true
-        layer?.backgroundColor = NSColor.black.withAlphaComponent(0.68).cgColor
+        layer?.backgroundColor = NSColor.black.cgColor
         layer?.cornerRadius = frameRect.height / 2
 
         let diameter: CGFloat = 4
