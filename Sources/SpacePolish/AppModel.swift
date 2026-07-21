@@ -20,7 +20,8 @@ final class AppModel: ObservableObject {
         self.keychain = keychain
         self.isEnabled = defaults.object(forKey: "isEnabled") as? Bool ?? true
         self.apiKey = (try? keychain.read()) ?? ""
-        self.modelName = defaults.string(forKey: "modelName") ?? "deepseek-chat"
+        let savedModel = defaults.string(forKey: "modelName")
+        self.modelName = savedModel == "qwen3.6-flash" ? savedModel! : "qwen3.7-plus"
         self.prompt = PromptPolicy.resolvedPrompt(from: defaults.string(forKey: "prompt"))
 
         let savedInterval = defaults.double(forKey: "triggerInterval")

@@ -4,9 +4,7 @@ import Foundation
 
 struct TextRewritePlan: Equatable {
     let capturedText: String
-    let cleanedText: String
     let cursorUTF16: Int
-    let triggerRange: NSRange
     let replacementRange: NSRange
     let sourceText: String
 }
@@ -14,17 +12,12 @@ struct TextRewritePlan: Equatable {
 enum TextRangePlanner {
     static func plan(text: String, cursorUTF16: Int) throws -> TextRewritePlan {
         let original = text as NSString
-        guard cursorUTF16 >= 0,
-              let triggerRange = triggerRange(in: original, cursorUTF16: cursorUTF16) else {
-            throw TextEditingError.triggerSpacesUnavailable
+        guard cursorUTF16 >= 0, cursorUTF16 <= original.length else {
+            throw TextEditingError.cursorUnavailable
         }
 
-        let cleaned = original.mutableCopy() as! NSMutableString
-        cleaned.deleteCharacters(in: triggerRange)
-        let cleanCursor = triggerRange.location
-
-        let prefixRange = NSRange(location: 0, length: cleanCursor)
-        let lastNewline = cleaned.range(
+        let prefixRange = NSRange(location: 0, length: cursorUTF16)
+        let lastNewline = original.range(
             of: "\n",
             options: .backwards,
             range: prefixRange
@@ -35,9 +28,9 @@ enum TextRangePlanner {
 
         let paragraphRange = NSRange(
             location: paragraphStart,
-            length: cleanCursor - paragraphStart
+            length: cursorUTF16 - paragraphStart
         )
-        let paragraph = cleaned.substring(with: paragraphRange) as NSString
+        let paragraph = original.substring(with: paragraphRange) as NSString
         let nonWhitespace = CharacterSet.whitespacesAndNewlines.inverted
         let first = paragraph.rangeOfCharacter(from: nonWhitespace)
         guard first.location != NSNotFound else {
@@ -49,41 +42,13 @@ enum TextRangePlanner {
             location: paragraphStart + first.location,
             length: last.location + last.length - first.location
         )
-        let source = cleaned.substring(with: replacementRange)
+        let source = original.substring(with: replacementRange)
         return TextRewritePlan(
             capturedText: text,
-            cleanedText: cleaned as String,
-            cursorUTF16: cleanCursor,
-            triggerRange: triggerRange,
+            cursorUTF16: cursorUTF16,
             replacementRange: replacementRange,
             sourceText: source
         )
-    }
-
-    private static func triggerRange(
-        in text: NSString,
-        cursorUTF16: Int
-    ) -> NSRange? {
-        let immediatelyBefore = NSRange(location: cursorUTF16 - 2, length: 2)
-        if immediatelyBefore.location >= 0,
-           NSMaxRange(immediatelyBefore) <= text.length,
-           text.substring(with: immediatelyBefore) == "  " {
-            return immediatelyBefore
-        }
-
-        let immediatelyAfter = NSRange(location: cursorUTF16, length: 2)
-        if NSMaxRange(immediatelyAfter) <= text.length,
-           text.substring(with: immediatelyAfter) == "  " {
-            return immediatelyAfter
-        }
-
-        let trailing = NSRange(location: text.length - 2, length: 2)
-        if trailing.location >= 0,
-           text.substring(with: trailing) == "  " {
-            return trailing
-        }
-
-        return nil
     }
 }
 
@@ -97,35 +62,75 @@ enum TextCommitPlanner {
     static func plan(
         currentText: String,
         capturedText: String,
-        cleanedText: String,
-        triggerRange: NSRange,
         sourceRange: NSRange,
         replacement: String
     ) throws -> TextCommitPlan {
-        let editRange: NSRange
-        if currentText == capturedText {
-            let editEnd = NSMaxRange(triggerRange)
-            guard sourceRange.location <= editEnd,
-                  editEnd <= (currentText as NSString).length else {
-                throw TextEditingError.textChangedWhileWaiting
-            }
-            editRange = NSRange(
-                location: sourceRange.location,
-                length: editEnd - sourceRange.location
-            )
-        } else if currentText == cleanedText {
-            editRange = sourceRange
-        } else {
+        guard currentText == capturedText,
+              NSMaxRange(sourceRange) <= (currentText as NSString).length else {
             throw TextEditingError.textChangedWhileWaiting
         }
 
         let updated = NSMutableString(string: currentText)
-        updated.replaceCharacters(in: editRange, with: replacement)
+        updated.replaceCharacters(in: sourceRange, with: replacement)
         return TextCommitPlan(
             updatedText: updated as String,
-            replacementRange: editRange,
-            cursorUTF16: updated.length
+            replacementRange: sourceRange,
+            cursorUTF16: sourceRange.location + (replacement as NSString).length
         )
+    }
+}
+
+enum KeyboardFallbackPolicy {
+    private static let excludedBundleIdentifiers: Set<String> = [
+        "com.spacepolish.mac",
+        "com.apple.Terminal",
+        "com.googlecode.iterm2",
+        "dev.warp.Warp-Stable",
+        "org.alacritty",
+        "com.mitchellh.ghostty"
+    ]
+
+    static func allows(bundleIdentifier: String) -> Bool {
+        !excludedBundleIdentifiers.contains(bundleIdentifier)
+    }
+}
+
+private enum TextInputSafety {
+    static func validate(_ element: AXUIElement) throws {
+        guard let subrole = stringAttribute(
+            kAXSubroleAttribute as CFString,
+            from: element
+        ) else {
+            return
+        }
+        if subrole == (kAXSecureTextFieldSubrole as String) {
+            throw TextEditingError.sensitiveTextField
+        }
+    }
+
+    static func validateFocusedElementIfAvailable() throws {
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            systemWide,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedRef
+        ) == .success,
+              let focusedRef else {
+            return
+        }
+        try validate(focusedRef as! AXUIElement)
+    }
+
+    private static func stringAttribute(
+        _ attribute: CFString,
+        from element: AXUIElement
+    ) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else {
+            return nil
+        }
+        return value as? String
     }
 }
 
@@ -137,53 +142,32 @@ final class CapturedTextContext {
 
     let target: Target
     let capturedText: String
-    let cleanedText: String
     let cursorUTF16: Int
-    let triggerRange: NSRange
     let replacementRange: NSRange
     let sourceText: String
 
     init(target: Target, plan: TextRewritePlan) {
         self.target = target
         self.capturedText = plan.capturedText
-        self.cleanedText = plan.cleanedText
         self.cursorUTF16 = plan.cursorUTF16
-        self.triggerRange = plan.triggerRange
         self.replacementRange = plan.replacementRange
         self.sourceText = plan.sourceText
     }
 }
 
 struct AccessibilityTextService {
-    func captureAndRemoveTriggerSpaces() throws -> CapturedTextContext {
+    func captureCurrentParagraph() throws -> CapturedTextContext {
         do {
-            return try captureUsingAccessibilityWithRetry()
+            return try captureUsingAccessibility()
         } catch let error as TextEditingError {
-            guard error == .noFocusedTextField || error == .unsupportedTextField,
+            let canRetryWithKeyboard = error == .noFocusedTextField
+                || error == .unsupportedTextField
+            guard canRetryWithKeyboard,
                   KeyboardTextFallback.supportsFrontmostApplication else {
                 throw error
             }
-            return try KeyboardTextFallback.captureAndRemoveTriggerSpaces()
+            return try KeyboardTextFallback.captureCurrentParagraph()
         }
-    }
-
-    private func captureUsingAccessibilityWithRetry() throws -> CapturedTextContext {
-        let retryDelays: [TimeInterval] = [0, 0.02, 0.05, 0.08]
-        var lastError: TextEditingError = .triggerSpacesUnavailable
-
-        for delay in retryDelays {
-            if delay > 0 {
-                Thread.sleep(forTimeInterval: delay)
-            }
-            do {
-                return try captureUsingAccessibility()
-            } catch let error as TextEditingError {
-                lastError = error
-                guard error == .triggerSpacesUnavailable else { throw error }
-            }
-        }
-
-        throw lastError
     }
 
     private func captureUsingAccessibility() throws -> CapturedTextContext {
@@ -198,6 +182,7 @@ struct AccessibilityTextService {
             throw TextEditingError.noFocusedTextField
         }
         let element = focusedValue as! AXUIElement
+        try TextInputSafety.validate(element)
 
         var valueRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(
@@ -269,8 +254,6 @@ struct AccessibilityTextService {
         let commit = try TextCommitPlanner.plan(
             currentText: current,
             capturedText: context.capturedText,
-            cleanedText: context.cleanedText,
-            triggerRange: context.triggerRange,
             sourceRange: context.replacementRange,
             replacement: replacement
         )
@@ -329,32 +312,38 @@ struct AccessibilityTextService {
         fallbackValue: String,
         finalCursor: Int
     ) throws {
-        var selectedRange = CFRange(location: range.location, length: range.length)
-        let rangeValue = AXValueCreate(.cfRange, &selectedRange)
-        let selectedTextSucceeded = rangeValue.map {
-            AXUIElementSetAttributeValue(
-                element,
-                kAXSelectedTextRangeAttribute as CFString,
-                $0
-            ) == .success
-                && AXUIElementSetAttributeValue(
-                    element,
-                    kAXSelectedTextAttribute as CFString,
-                    replacement as CFTypeRef
-                ) == .success
-        } ?? false
+        // Writing the complete value first avoids creating a visible selection in
+        // standard, browser and Electron text editors. Some controls expose a
+        // read-only AXValue but still allow replacing AXSelectedText, so retain
+        // that narrower operation as the second strategy.
+        let fullValueSet = AXUIElementSetAttributeValue(
+            element,
+            kAXValueAttribute as CFString,
+            fallbackValue as CFTypeRef
+        ) == .success
 
-        if !selectedTextSucceeded {
-            guard AXUIElementSetAttributeValue(
-                element,
-                kAXValueAttribute as CFString,
-                fallbackValue as CFTypeRef
-            ) == .success else {
+        if !fullValueSet {
+            var selectedRange = CFRange(location: range.location, length: range.length)
+            let rangeValue = AXValueCreate(.cfRange, &selectedRange)
+            let selectedTextSucceeded = rangeValue.map {
+                AXUIElementSetAttributeValue(
+                    element,
+                    kAXSelectedTextRangeAttribute as CFString,
+                    $0
+                ) == .success
+                    && AXUIElementSetAttributeValue(
+                        element,
+                        kAXSelectedTextAttribute as CFString,
+                        replacement as CFTypeRef
+                    ) == .success
+            } ?? false
+
+            guard selectedTextSucceeded else {
                 throw TextEditingError.readOnlyTextField
             }
         }
 
-        try setSelection(
+        try? setSelection(
             on: element,
             range: CFRange(location: finalCursor, length: 0)
         )
@@ -548,21 +537,20 @@ private func postRightArrowKey() -> Bool {
 }
 
 private enum KeyboardTextFallback {
-    private static let supportedBundleIdentifiers = ["com.tencent.xinWeChat"]
-
     static var supportsFrontmostApplication: Bool {
         guard let bundleIdentifier = NSWorkspace.shared.frontmostApplication?.bundleIdentifier else {
             return false
         }
-        return supportedBundleIdentifiers.contains(bundleIdentifier)
+        return KeyboardFallbackPolicy.allows(bundleIdentifier: bundleIdentifier)
     }
 
-    static func captureAndRemoveTriggerSpaces() throws -> CapturedTextContext {
+    static func captureCurrentParagraph() throws -> CapturedTextContext {
         guard let application = NSWorkspace.shared.frontmostApplication,
               let bundleIdentifier = application.bundleIdentifier,
-              supportedBundleIdentifiers.contains(bundleIdentifier) else {
+              KeyboardFallbackPolicy.allows(bundleIdentifier: bundleIdentifier) else {
             throw TextEditingError.noFocusedTextField
         }
+        try TextInputSafety.validateFocusedElementIfAvailable()
 
         let processIdentifier = application.processIdentifier
         let text = try readAllText(processIdentifier: processIdentifier)
@@ -585,8 +573,6 @@ private enum KeyboardTextFallback {
         let commit = try TextCommitPlanner.plan(
             currentText: current,
             capturedText: context.capturedText,
-            cleanedText: context.cleanedText,
-            triggerRange: context.triggerRange,
             sourceRange: context.replacementRange,
             replacement: replacement
         )
@@ -613,8 +599,9 @@ private enum KeyboardTextFallback {
         let snapshot = PasteboardSnapshot(pasteboard: pasteboard)
         defer { snapshot.restore(to: pasteboard) }
 
-        try performMenuCommand(
-            titles: ["全选"],
+        try performShortcut(
+            keyCode: 0,
+            modifiers: .maskCommand,
             processIdentifier: processIdentifier
         )
         defer { try? collapseSelectionToEnd(processIdentifier: processIdentifier) }
@@ -625,15 +612,35 @@ private enum KeyboardTextFallback {
         pasteboard.setString(marker, forType: .string)
         let markerChangeCount = pasteboard.changeCount
 
-        try performMenuCommand(
-            titles: ["复制", "拷贝"],
+        try performShortcut(
+            keyCode: 8,
+            modifiers: .maskCommand,
             processIdentifier: processIdentifier
         )
-        guard waitForPasteboardChange(
+        var copied = waitForPasteboardChange(
             pasteboard,
             after: markerChangeCount,
             timeout: 0.8
-        ),
+        )
+        if !copied {
+            // A few custom editors ignore synthetic shortcuts but expose menu
+            // actions. Keep this compatibility path for those applications.
+            try performMenuCommand(
+                titles: ["全选", "Select All"],
+                processIdentifier: processIdentifier
+            )
+            wait(0.05)
+            try performMenuCommand(
+                titles: ["复制", "拷贝", "Copy"],
+                processIdentifier: processIdentifier
+            )
+            copied = waitForPasteboardChange(
+                pasteboard,
+                after: markerChangeCount,
+                timeout: 0.4
+            )
+        }
+        guard copied,
               let text = pasteboard.string(forType: .string),
               text != marker else {
             throw TextEditingError.keyboardTextUnavailable
@@ -653,13 +660,15 @@ private enum KeyboardTextFallback {
             throw TextEditingError.keyboardTextUnavailable
         }
 
-        try performMenuCommand(
-            titles: ["全选"],
+        try performShortcut(
+            keyCode: 0,
+            modifiers: .maskCommand,
             processIdentifier: processIdentifier
         )
         wait(0.06)
-        try performMenuCommand(
-            titles: ["粘贴"],
+        try performShortcut(
+            keyCode: 9,
+            modifiers: .maskCommand,
             processIdentifier: processIdentifier
         )
         wait(0.12)
@@ -669,12 +678,36 @@ private enum KeyboardTextFallback {
     private static func collapseSelectionToEnd(processIdentifier: pid_t) throws {
         try ensureFrontmost(processIdentifier)
 
-        // 微信的自绘输入框在“全选 + 复制/粘贴”后有时仍保留整段选区。
-        // 这里必须投递到系统事件流；直接 postToPid 在微信 4.x 中可能被忽略。
+        // Custom editors sometimes keep the full selection after copy/paste.
+        // A right-arrow event collapses it to the end without changing text.
         guard postRightArrowKey() else {
             throw TextEditingError.keyboardTextUnavailable
         }
         wait(0.04)
+    }
+
+    private static func performShortcut(
+        keyCode: CGKeyCode,
+        modifiers: CGEventFlags,
+        processIdentifier: pid_t
+    ) throws {
+        try ensureFrontmost(processIdentifier)
+        guard let keyDown = CGEvent(
+            keyboardEventSource: nil,
+            virtualKey: keyCode,
+            keyDown: true
+        ),
+              let keyUp = CGEvent(
+                keyboardEventSource: nil,
+                virtualKey: keyCode,
+                keyDown: false
+              ) else {
+            throw TextEditingError.keyboardTextUnavailable
+        }
+        keyDown.flags = modifiers
+        keyUp.flags = modifiers
+        keyDown.post(tap: .cghidEventTap)
+        keyUp.post(tap: .cghidEventTap)
     }
 
     private static func ensureFrontmost(_ processIdentifier: pid_t) throws {
@@ -881,13 +914,14 @@ private struct PasteboardSnapshot {
 enum TextEditingError: LocalizedError, Equatable {
     case noFocusedTextField
     case unsupportedTextField
-    case triggerSpacesUnavailable
+    case cursorUnavailable
     case noTextToOptimize
     case readOnlyTextField
     case cannotSetSelection
     case targetDisappeared
     case textChangedWhileWaiting
     case keyboardTextUnavailable
+    case sensitiveTextField
 
     var errorDescription: String? {
         switch self {
@@ -895,8 +929,8 @@ enum TextEditingError: LocalizedError, Equatable {
             return "没有找到正在输入的文本框"
         case .unsupportedTextField:
             return "这个输入框暂不支持直接读取文本"
-        case .triggerSpacesUnavailable:
-            return "没有在光标前找到触发用的两个空格"
+        case .cursorUnavailable:
+            return "无法确定当前输入光标的位置"
         case .noTextToOptimize:
             return "当前段落没有可优化的文字"
         case .readOnlyTextField:
@@ -908,7 +942,9 @@ enum TextEditingError: LocalizedError, Equatable {
         case .textChangedWhileWaiting:
             return "等待 AI 时文本已被修改，因此没有覆盖你的新内容"
         case .keyboardTextUnavailable:
-            return "无法读取微信输入框，请把光标放回输入区后重试"
+            return "无法读取这个输入框，请确认光标位于文字末尾后重试"
+        case .sensitiveTextField:
+            return "为了保护隐私，密码和安全输入框不会进行优化"
         }
     }
 }

@@ -9,7 +9,8 @@ cd "$PROJECT_DIR"
 swiftc \
     -framework AppKit \
     -framework ApplicationServices \
-    Sources/SpacePolish/DeepSeekClient.swift \
+    Sources/SpacePolish/DoubleOptionMonitor.swift \
+    Sources/SpacePolish/QwenClient.swift \
     Sources/SpacePolish/PromptPolicy.swift \
     Sources/SpacePolish/TextEditing.swift \
     Checks/main.swift \

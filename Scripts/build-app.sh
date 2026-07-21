@@ -13,6 +13,7 @@ swift build -c release
 mkdir -p "$CONTENTS_DIR/MacOS" "$CONTENTS_DIR/Resources"
 cp "$PROJECT_DIR/.build/release/SpacePolish" "$CONTENTS_DIR/MacOS/SpacePolish"
 cp "$PROJECT_DIR/Resources/Info.plist" "$CONTENTS_DIR/Info.plist"
+cp "$PROJECT_DIR/Resources/SpacePolish.icns" "$CONTENTS_DIR/Resources/SpacePolish.icns"
 
 if [[ -z "$SIGNING_IDENTITY" ]]; then
     SIGNING_IDENTITY="$(

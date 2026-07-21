@@ -1,11 +1,25 @@
 import AppKit
 
 final class AppCoordinator: NSObject, NSMenuDelegate {
+    private enum RewriteAction {
+        case polish
+        case translate
+
+        var promptDescription: String {
+            switch self {
+            case .polish:
+                return "正在优化…"
+            case .translate:
+                return "正在翻译…"
+            }
+        }
+    }
+
     let model = AppModel()
 
-    private let client = DeepSeekClient()
+    private let client = QwenClient()
     private let textService = AccessibilityTextService()
-    private let monitor = TripleSpaceMonitor()
+    private let monitor = DoubleOptionMonitor()
     private let hud = StatusHUD()
     private let inputProgressIndicator = InputProgressIndicator()
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -30,8 +44,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         monitor.maximumInterval = { [weak self] in
             self?.model.triggerInterval ?? 1.2
         }
-        monitor.onTrigger = { [weak self] in
-            self?.handleTrigger()
+        monitor.onTrigger = { [weak self] side in
+            self?.handleTrigger(side == .right ? .translate : .polish)
         }
 
         NotificationCenter.default.addObserver(
@@ -51,7 +65,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         }
         startMonitor()
         if !model.hasAPIKey {
-            model.statusText = "请设置 DeepSeek API Key"
+            model.statusText = "请设置通义千问 API Key"
             openSettings()
         }
     }
@@ -69,7 +83,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
 
         let toggle = NSMenuItem(
-            title: model.isEnabled ? "暂停三空格触发" : "启用三空格触发",
+            title: model.isEnabled ? "暂停 Option 快捷键" : "启用 Option 快捷键",
             action: #selector(toggleEnabled),
             keyEquivalent: ""
         )
@@ -99,7 +113,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     @objc private func toggleEnabled() {
         model.isEnabled.toggle()
         try? model.save()
-        model.statusText = model.isEnabled ? "已启用" : "已暂停"
+        model.statusText = model.isEnabled ? readyStatusText : "已暂停"
     }
 
     @objc func openSettings() {
@@ -147,16 +161,20 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         do {
             try monitor.start()
             isMonitorStarted = true
-            model.statusText = model.isEnabled ? "已启用：连续输入三个空格" : "已暂停"
+            model.statusText = model.isEnabled ? readyStatusText : "已暂停"
         } catch {
             model.statusText = "无法监听键盘"
             showError(error.localizedDescription)
         }
     }
 
-    private func handleTrigger() {
+    private var readyStatusText: String {
+        "左 Option 润色 · 右 Option 翻译"
+    }
+
+    private func handleTrigger(_ action: RewriteAction) {
         guard model.hasAPIKey else {
-            showError("请先在设置中填写 DeepSeek API Key")
+            showError("请先在设置中填写通义千问 API Key")
             openSettings()
             return
         }
@@ -164,20 +182,20 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
 
         let context: CapturedTextContext
         do {
-            context = try textService.captureAndRemoveTriggerSpaces()
+            context = try textService.captureCurrentParagraph()
         } catch {
             showError(error.localizedDescription)
             return
         }
 
         model.isProcessing = true
-        model.statusText = "正在优化…"
+        model.statusText = action.promptDescription
         let insertionPoint = textService.insertionPointScreenRect(for: context)
         inputProgressIndicator.show(at: insertionPoint)
 
         let key = model.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let selectedModel = model.modelName
-        let prompt = model.prompt
+        let prompt = action == .translate ? TranslationPolicy.prompt : model.prompt
 
         Task { [weak self] in
             guard let self else { return }
@@ -194,15 +212,18 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         result: result
                     )
                     try self.textService.replace(context: context, with: result)
-                    self.inputProgressIndicator.finish(with: outcome)
+                    self.inputProgressIndicator.finish(
+                        with: outcome,
+                        operation: action == .translate ? .translation : .optimization
+                    )
                     self.model.isProcessing = false
                     self.model.statusText = self.model.isEnabled
-                        ? "已启用：连续输入三个空格"
+                        ? self.readyStatusText
                         : "已暂停"
                 }
             } catch {
                 await MainActor.run {
-                    self.inputProgressIndicator.hide()
+                    self.inputProgressIndicator.fail()
                     self.model.isProcessing = false
                     self.showError(error.localizedDescription)
                 }

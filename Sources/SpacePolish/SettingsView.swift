@@ -64,7 +64,7 @@ final class SettingsWindowController: NSWindowController {
 
         let title = NSTextField(labelWithString: "SpacePolish")
         title.font = .systemFont(ofSize: 24, weight: .semibold)
-        let subtitle = NSTextField(labelWithString: "在当前段落末尾连续输入三个空格，自动优化表达。")
+        let subtitle = NSTextField(labelWithString: "左 Option 连按两次润色，右 Option 连按两次翻译。")
         subtitle.textColor = .secondaryLabelColor
         let header = verticalStack([title, subtitle], spacing: 4)
         stack.addArrangedSubview(header)
@@ -75,22 +75,22 @@ final class SettingsWindowController: NSWindowController {
         apiKeyField.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
 
         let modelLabel = NSTextField(labelWithString: "模型")
-        modelPicker.addItems(withTitles: ["DeepSeek Chat", "DeepSeek Reasoner"])
-        modelPicker.setAccessibilityLabel("DeepSeek 模型")
+        modelPicker.addItems(withTitles: ["Qwen 3.7 Plus", "Qwen 3.6 Flash"])
+        modelPicker.setAccessibilityLabel("通义千问模型")
 
         let keyButton = NSButton(title: "获取 API Key", target: self, action: #selector(openAPIKeyPage))
         keyButton.bezelStyle = .inline
         let modelRow = horizontalStack([modelLabel, modelPicker, flexibleSpacer(), keyButton], spacing: 10)
 
         let privacy = NSTextField(
-            wrappingLabelWithString: "API Key 只保存在 macOS 钥匙串中。触发优化时，当前段落会发送给 DeepSeek。"
+            wrappingLabelWithString: "API Key 只保存在 macOS 钥匙串中。触发润色或翻译时，当前段落会发送给通义千问。"
         )
         privacy.font = .systemFont(ofSize: 11)
         privacy.textColor = .secondaryLabelColor
 
-        let deepSeekStack = verticalStack([apiLabel, apiKeyField, modelRow, privacy], spacing: 10)
-        let deepSeekBox = makeBox(title: "DeepSeek", content: deepSeekStack, height: 160)
-        stack.addArrangedSubview(deepSeekBox)
+        let qwenStack = verticalStack([apiLabel, apiKeyField, modelRow, privacy], spacing: 10)
+        let qwenBox = makeBox(title: "通义千问", content: qwenStack, height: 160)
+        stack.addArrangedSubview(qwenBox)
 
         promptTextView.font = .systemFont(ofSize: 12)
         promptTextView.isRichText = false
@@ -113,7 +113,7 @@ final class SettingsWindowController: NSWindowController {
         intervalLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         intervalLabel.alignment = .right
         intervalLabel.widthAnchor.constraint(equalToConstant: 52).isActive = true
-        let intervalTitle = NSTextField(labelWithString: "三次空格最长间隔")
+        let intervalTitle = NSTextField(labelWithString: "两次 Option 最长间隔")
         let intervalRow = horizontalStack(
             [intervalTitle, intervalSlider, intervalLabel],
             spacing: 10
@@ -133,7 +133,7 @@ final class SettingsWindowController: NSWindowController {
         )
         stack.addArrangedSubview(footer)
 
-        [header, deepSeekBox, promptBox, footer].forEach {
+        [header, qwenBox, promptBox, footer].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             $0.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
@@ -189,7 +189,7 @@ final class SettingsWindowController: NSWindowController {
 
     private func loadModelIntoControls() {
         apiKeyField.stringValue = model.apiKey
-        modelPicker.selectItem(at: model.modelName == "deepseek-reasoner" ? 1 : 0)
+        modelPicker.selectItem(at: model.modelName == "qwen3.6-flash" ? 1 : 0)
         promptTextView.string = model.prompt
         intervalSlider.doubleValue = model.triggerInterval
         updateIntervalLabel()
@@ -214,7 +214,7 @@ final class SettingsWindowController: NSWindowController {
     }
 
     @objc private func openAPIKeyPage() {
-        guard let url = URL(string: "https://platform.deepseek.com/api_keys") else { return }
+        guard let url = URL(string: "https://bailian.console.aliyun.com/?tab=model#/api-key") else { return }
         NSWorkspace.shared.open(url)
     }
 
@@ -229,8 +229,8 @@ final class SettingsWindowController: NSWindowController {
     @objc private func saveClicked() {
         model.apiKey = apiKeyField.stringValue
         model.modelName = modelPicker.indexOfSelectedItem == 1
-            ? "deepseek-reasoner"
-            : "deepseek-chat"
+            ? "qwen3.6-flash"
+            : "qwen3.7-plus"
         model.prompt = promptTextView.string
         model.triggerInterval = intervalSlider.doubleValue
         onSave()

@@ -3,7 +3,7 @@ import Security
 
 struct KeychainStore {
     private let service = "com.spacepolish.mac"
-    private let account = "deepseek-api-key"
+    private let account = "qwen-api-key"
 
     func save(_ value: String) throws {
         let data = Data(value.utf8)

@@ -1,9 +1,12 @@
 import Foundation
 
-struct DeepSeekClient {
+struct QwenClient {
     static let temperature = 0.5
+    static let enableThinking = false
 
-    private let endpoint = URL(string: "https://api.deepseek.com/chat/completions")!
+    private let endpoint = URL(
+        string: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+    )!
 
     func optimize(
         text: String,
@@ -25,20 +28,21 @@ struct DeepSeekClient {
             ],
             stream: false,
             temperature: Self.temperature,
+            enableThinking: Self.enableThinking,
             maxTokens: 2_048
         )
         request.httpBody = try JSONEncoder().encode(body)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
-            throw DeepSeekError.invalidResponse
+            throw QwenError.invalidResponse
         }
 
         guard (200...299).contains(httpResponse.statusCode) else {
             let apiError = try? JSONDecoder().decode(APIErrorEnvelope.self, from: data)
-            throw DeepSeekError.http(
+            throw QwenError.http(
                 statusCode: httpResponse.statusCode,
-                message: apiError?.error.message ?? "DeepSeek 服务返回了错误"
+                message: apiError?.error.message ?? "通义千问服务返回了错误"
             )
         }
 
@@ -46,7 +50,7 @@ struct DeepSeekClient {
         guard let content = result.choices.first?.message.content
             .trimmingCharacters(in: .whitespacesAndNewlines),
               !content.isEmpty else {
-            throw DeepSeekError.emptyResult
+            throw QwenError.emptyResult
         }
         return content
     }
@@ -57,10 +61,12 @@ private struct ChatRequest: Encodable {
     let messages: [Message]
     let stream: Bool
     let temperature: Double
+    let enableThinking: Bool
     let maxTokens: Int
 
     enum CodingKeys: String, CodingKey {
         case model, messages, stream, temperature
+        case enableThinking = "enable_thinking"
         case maxTokens = "max_tokens"
     }
 }
@@ -84,7 +90,7 @@ private struct APIErrorEnvelope: Decodable {
     let error: APIError
 }
 
-enum DeepSeekError: LocalizedError {
+enum QwenError: LocalizedError {
     case invalidResponse
     case http(statusCode: Int, message: String)
     case emptyResult
@@ -94,9 +100,9 @@ enum DeepSeekError: LocalizedError {
         case .invalidResponse:
             return "没有收到有效的网络响应"
         case .http(let statusCode, let message):
-            return "DeepSeek API 错误（\(statusCode)）：\(message)"
+            return "通义千问 API 错误（\(statusCode)）：\(message)"
         case .emptyResult:
-            return "DeepSeek 返回了空内容"
+            return "通义千问返回了空内容"
         }
     }
 }

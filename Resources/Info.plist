@@ -8,6 +8,8 @@
     <string>SpacePolish</string>
     <key>CFBundleIdentifier</key>
     <string>com.spacepolish.mac</string>
+    <key>CFBundleIconFile</key>
+    <string>SpacePolish.icns</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
