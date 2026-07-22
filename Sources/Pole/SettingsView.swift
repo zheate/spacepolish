@@ -1,9 +1,14 @@
 import AppKit
 
+private final class FlippedSettingsDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 final class SettingsWindowController: NSWindowController {
     private let model: AppModel
     private let onSave: () -> Void
     private let onRequestPermission: () -> Void
+    private let onRequestScreenCapturePermission: () -> Void
 
     private let apiKeyField = NSSecureTextField()
     private let modelPicker = NSPopUpButton()
@@ -11,21 +16,30 @@ final class SettingsWindowController: NSWindowController {
     private let intervalSlider = NSSlider(value: 1.2, minValue: 0.5, maxValue: 2.0, target: nil, action: nil)
     private let intervalLabel = NSTextField(labelWithString: "1.2 秒")
     private let permissionLabel = NSTextField(labelWithString: "")
+    private let screenCapturePermissionLabel = NSTextField(labelWithString: "")
+    private let conversationProfilesView: ConversationProfilesSettingsView
 
-    init(model: AppModel, onSave: @escaping () -> Void, onRequestPermission: @escaping () -> Void) {
+    init(
+        model: AppModel,
+        onSave: @escaping () -> Void,
+        onRequestPermission: @escaping () -> Void,
+        onRequestScreenCapturePermission: @escaping () -> Void
+    ) {
         self.model = model
         self.onSave = onSave
         self.onRequestPermission = onRequestPermission
+        self.onRequestScreenCapturePermission = onRequestScreenCapturePermission
+        self.conversationProfilesView = ConversationProfilesSettingsView(store: model.conversationProfiles)
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 590, height: 540),
+            contentRect: NSRect(x: 0, y: 0, width: 620, height: 800),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Pole 设置"
         window.isReleasedWhenClosed = false
-        window.contentMinSize = NSSize(width: 540, height: 520)
+        window.contentMinSize = NSSize(width: 570, height: 720)
         super.init(window: window)
 
         window.contentView = buildContentView()
@@ -48,18 +62,37 @@ final class SettingsWindowController: NSWindowController {
 
     private func buildContentView() -> NSView {
         let root = NSView()
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(scrollView)
+        NSLayoutConstraint.activate([
+            scrollView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: root.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: root.bottomAnchor)
+        ])
+
+        let document = FlippedSettingsDocumentView(
+            frame: NSRect(x: 0, y: 0, width: 620, height: 1080)
+        )
+        document.autoresizingMask = [.width]
+        scrollView.documentView = document
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 16
         stack.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(stack)
+        document.addSubview(stack)
 
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
-            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
-            stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 22),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: root.bottomAnchor, constant: -20)
+            stack.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -24),
+            stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 22),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: document.bottomAnchor, constant: -20)
         ])
 
         let title = NSTextField(labelWithString: "Pole")
@@ -83,13 +116,13 @@ final class SettingsWindowController: NSWindowController {
         let modelRow = horizontalStack([modelLabel, modelPicker, flexibleSpacer(), keyButton], spacing: 10)
 
         let privacy = NSTextField(
-            wrappingLabelWithString: "API Key 只保存在 macOS 钥匙串中。触发润色或翻译时，当前段落会发送给通义千问。"
+            wrappingLabelWithString: "API Key 只保存在 macOS 钥匙串中。润色或翻译时，当前段落会发送给通义千问。聊天对象名称与 OCR 图像不会发送。"
         )
         privacy.font = .systemFont(ofSize: 11)
         privacy.textColor = .secondaryLabelColor
 
         let qwenStack = verticalStack([apiLabel, apiKeyField, modelRow, privacy], spacing: 10)
-        let qwenBox = makeBox(title: "通义千问", content: qwenStack, height: 160)
+        let qwenBox = makeBox(title: "通义千问", content: qwenStack, height: 164)
         stack.addArrangedSubview(qwenBox)
 
         promptTextView.font = .systemFont(ofSize: 12)
@@ -123,6 +156,44 @@ final class SettingsWindowController: NSWindowController {
         let promptBox = makeBox(title: "优化规则", content: promptStack, height: 185)
         stack.addArrangedSubview(promptBox)
 
+        let applicationRoleDescription = NSTextField(
+            wrappingLabelWithString: "Codex：AI 开发助手 · ChatGPT：AI 助手\n微信、企业微信等：识别当前聊天对象；明确称谓会自动匹配角色\n邮件、开发工具和文档应用：使用对应场景规则；其他应用使用通用润色。"
+        )
+        applicationRoleDescription.font = .systemFont(ofSize: 11)
+        applicationRoleDescription.textColor = .secondaryLabelColor
+        let applicationRoleBox = makeBox(
+            title: "应用角色（自动）",
+            content: applicationRoleDescription,
+            height: 92
+        )
+        stack.addArrangedSubview(applicationRoleBox)
+
+        let screenCaptureButton = NSButton(
+            title: "启用 OCR 识别",
+            target: self,
+            action: #selector(screenCapturePermissionClicked)
+        )
+        screenCaptureButton.bezelStyle = .rounded
+        let screenCaptureRow = horizontalStack(
+            [screenCapturePermissionLabel, flexibleSpacer(), screenCaptureButton],
+            spacing: 10
+        )
+        let screenCaptureHint = NSTextField(
+            wrappingLabelWithString: "Pole 会优先读取聊天窗口标题；读取不到时，才在已授权情况下截取当前窗口顶部并在本机 OCR 识别。"
+        )
+        screenCaptureHint.font = .systemFont(ofSize: 11)
+        screenCaptureHint.textColor = .secondaryLabelColor
+        let screenCaptureStack = verticalStack([screenCaptureRow, screenCaptureHint], spacing: 8)
+        let screenCaptureBox = makeBox(title: "聊天对象识别", content: screenCaptureStack, height: 88)
+        stack.addArrangedSubview(screenCaptureBox)
+
+        let conversationProfilesBox = makeBox(
+            title: "聊天对象",
+            content: conversationProfilesView,
+            height: 276
+        )
+        stack.addArrangedSubview(conversationProfilesBox)
+
         let permissionButton = NSButton(title: "去授权 / 刷新", target: self, action: #selector(permissionClicked))
         let saveButton = NSButton(title: "保存", target: self, action: #selector(saveClicked))
         saveButton.keyEquivalent = "\r"
@@ -133,7 +204,15 @@ final class SettingsWindowController: NSWindowController {
         )
         stack.addArrangedSubview(footer)
 
-        [header, qwenBox, promptBox, footer].forEach {
+        [
+            header,
+            qwenBox,
+            promptBox,
+            applicationRoleBox,
+            screenCaptureBox,
+            conversationProfilesBox,
+            footer
+        ].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
             $0.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
@@ -203,6 +282,13 @@ final class SettingsWindowController: NSWindowController {
             permissionLabel.stringValue = "● 需要辅助功能权限"
             permissionLabel.textColor = .systemOrange
         }
+        if ScreenCapturePermission.isGranted {
+            screenCapturePermissionLabel.stringValue = "● OCR 屏幕录制权限已授予"
+            screenCapturePermissionLabel.textColor = .systemGreen
+        } else {
+            screenCapturePermissionLabel.stringValue = "● OCR 识别未授权（仍可读取窗口标题）"
+            screenCapturePermissionLabel.textColor = .secondaryLabelColor
+        }
     }
 
     @objc private func intervalChanged() {
@@ -224,6 +310,10 @@ final class SettingsWindowController: NSWindowController {
         } else {
             onRequestPermission()
         }
+    }
+
+    @objc private func screenCapturePermissionClicked() {
+        onRequestScreenCapturePermission()
     }
 
     @objc private func saveClicked() {

@@ -47,12 +47,35 @@ struct QwenClient {
         }
 
         let result = try JSONDecoder().decode(ChatResponse.self, from: data)
-        guard let content = result.choices.first?.message.content
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-              !content.isEmpty else {
+        return try RewriteResultPolicy.prepare(
+            result.choices.first?.message.content,
+            preservingBoundaryWhitespaceOf: text
+        )
+    }
+}
+
+enum RewriteResultPolicy {
+    static func prepare(
+        _ content: String?,
+        preservingBoundaryWhitespaceOf sourceText: String
+    ) throws -> String {
+        guard let content,
+              content.rangeOfCharacter(
+                from: .whitespacesAndNewlines.inverted
+              ) != nil else {
             throw QwenError.emptyResult
         }
-        return content
+
+        let resultCore = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard sourceText.contains(where: { !$0.isWhitespace }) else {
+            return resultCore
+        }
+
+        let leadingWhitespace = sourceText.prefix(while: \Character.isWhitespace)
+        let trailingWhitespace = sourceText.reversed().prefix(while: \Character.isWhitespace)
+        return String(leadingWhitespace)
+            + resultCore
+            + String(trailingWhitespace.reversed())
     }
 }
 

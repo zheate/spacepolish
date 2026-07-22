@@ -9,14 +9,27 @@ struct TextRewritePlan: Equatable {
     let sourceText: String
 }
 
+enum UTF16TextRangeValidator {
+    static func isValid(_ range: NSRange, in text: String) -> Bool {
+        isValid(range, forLength: (text as NSString).length)
+    }
+
+    static func isValid(_ range: NSRange, forLength length: Int) -> Bool {
+        range.location != NSNotFound
+            && range.location >= 0
+            && range.length >= 0
+            && range.location <= length
+            && range.length <= length - range.location
+    }
+}
+
 enum TextRangePlanner {
     static func plan(text: String, selectedRange: NSRange) throws -> TextRewritePlan {
         let original = text as NSString
-        guard selectedRange.location != NSNotFound,
-              selectedRange.location >= 0,
-              selectedRange.location <= original.length,
-              selectedRange.length >= 0,
-              selectedRange.length <= original.length - selectedRange.location else {
+        guard UTF16TextRangeValidator.isValid(
+            selectedRange,
+            forLength: original.length
+        ) else {
             throw TextEditingError.cursorUnavailable
         }
 
@@ -47,7 +60,7 @@ enum TextSelectionResolver {
         let original = text as NSString
 
         if let accessibilityRange,
-           isValid(accessibilityRange, forUTF16Length: original.length) {
+           UTF16TextRangeValidator.isValid(accessibilityRange, forLength: original.length) {
             if accessibilityRange.length == 0 {
                 if copiedSelection == nil || copiedSelection?.isEmpty == true {
                     return accessibilityRange
@@ -81,14 +94,6 @@ enum TextSelectionResolver {
         }
         return first
     }
-
-    private static func isValid(_ range: NSRange, forUTF16Length length: Int) -> Bool {
-        range.location != NSNotFound
-            && range.location >= 0
-            && range.location <= length
-            && range.length >= 0
-            && range.length <= length - range.location
-    }
 }
 
 struct TextCommitPlan: Equatable {
@@ -105,7 +110,7 @@ enum TextCommitPlanner {
         replacement: String
     ) throws -> TextCommitPlan {
         guard currentText == capturedText,
-              NSMaxRange(sourceRange) <= (currentText as NSString).length else {
+              UTF16TextRangeValidator.isValid(sourceRange, in: currentText) else {
             throw TextEditingError.textChangedWhileWaiting
         }
 
@@ -413,6 +418,29 @@ struct AccessibilityTextService {
                 with: replacement,
                 processIdentifier: processIdentifier
             )
+        }
+    }
+
+    func isCurrent(_ context: CapturedTextContext) -> Bool {
+        switch context.target {
+        case .accessibility(let element):
+            var processIdentifier: pid_t = 0
+            guard AXUIElementGetPid(element, &processIdentifier) == .success,
+                  NSWorkspace.shared.frontmostApplication?.processIdentifier == processIdentifier else {
+                return false
+            }
+            var valueRef: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(
+                element,
+                kAXValueAttribute as CFString,
+                &valueRef
+            ) == .success,
+                  let currentText = valueRef as? String else {
+                return false
+            }
+            return currentText == context.capturedText
+        case .keyboard(let processIdentifier):
+            return NSWorkspace.shared.frontmostApplication?.processIdentifier == processIdentifier
         }
     }
 

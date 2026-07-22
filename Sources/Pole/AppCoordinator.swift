@@ -26,9 +26,11 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
 
     private let client = QwenClient()
     private let textService = AccessibilityTextService()
+    private let conversationResolver = ConversationResolver()
     private let monitor = DoubleOptionMonitor()
     private let hud = StatusHUD()
     private let inputProgressIndicator = InputProgressIndicator()
+    private let conversationProfilePanel = ConversationProfilePanel()
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private var settingsController: SettingsWindowController?
     private var isMonitorStarted = false
@@ -72,6 +74,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             return
         }
         startMonitor()
+        ConversationResolver.prewarmTextRecognition()
         if !model.hasAPIKey {
             model.statusText = "请设置通义千问 API Key"
             openSettings()
@@ -129,7 +132,10 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             settingsController = SettingsWindowController(
                 model: model,
                 onSave: { [weak self] in self?.saveSettings() },
-                onRequestPermission: { [weak self] in self?.requestPermission() }
+                onRequestPermission: { [weak self] in self?.requestPermission() },
+                onRequestScreenCapturePermission: { [weak self] in
+                    self?.requestScreenCapturePermission()
+                }
             )
         }
         settingsController?.present()
@@ -139,6 +145,14 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         AccessibilityPermission.request()
         AccessibilityPermission.openSystemSettings()
         model.statusText = "授权后请切回 Pole"
+    }
+
+    private func requestScreenCapturePermission() {
+        ScreenCapturePermission.request()
+        if !ScreenCapturePermission.isGranted {
+            ScreenCapturePermission.openSystemSettings()
+        }
+        settingsController?.refreshPermissionState()
     }
 
     @objc private func applicationDidBecomeActive() {
@@ -195,14 +209,189 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             return
         }
 
+        if action == .polish {
+            handlePolishTrigger(context: context)
+        } else {
+            beginRewrite(
+                context: context,
+                action: .translate,
+                prompt: TranslationPolicy.prompt,
+                conversationSnapshot: nil
+            )
+        }
+    }
+
+    private func handlePolishTrigger(context: CapturedTextContext) {
+        let snapshot = conversationResolver.resolveCurrentConversation()
+        if let snapshot,
+           !snapshot.applicationContext.supportsConversationProfiles {
+            beginRewrite(
+                context: context,
+                action: .polish,
+                prompt: polishPrompt(for: snapshot),
+                conversationSnapshot: snapshot
+            )
+            return
+        }
+
+        if let snapshot,
+           let profile = model.conversationProfiles.profile(for: snapshot) {
+            beginRewrite(
+                context: context,
+                action: .polish,
+                prompt: polishPrompt(
+                    for: snapshot,
+                    conversationInstruction: profile.modelInstruction
+                ),
+                conversationSnapshot: snapshot
+            )
+            return
+        }
+
+        if let snapshot,
+           let profile = model.conversationProfiles.createInferredProfile(for: snapshot) {
+            beginRewrite(
+                context: context,
+                action: .polish,
+                prompt: polishPrompt(
+                    for: snapshot,
+                    conversationInstruction: profile.modelInstruction
+                ),
+                conversationSnapshot: snapshot
+            )
+            return
+        }
+
+        if let snapshot,
+           snapshot.canCreateProfile,
+           let title = snapshot.title {
+            showConversationProfilePanel(
+                for: snapshot,
+                title: title,
+                context: context
+            )
+            return
+        }
+
+        beginRewrite(
+            context: context,
+            action: .polish,
+            prompt: polishPrompt(for: snapshot),
+            conversationSnapshot: snapshot
+        )
+    }
+
+    private func polishPrompt(
+        for snapshot: ConversationSnapshot?,
+        conversationInstruction: String? = nil
+    ) -> String {
+        let contextInstruction = snapshot.flatMap {
+            ApplicationContextPolicy.contextInstruction(
+                for: $0.applicationContext,
+                conversationInstruction: conversationInstruction
+            )
+        }
+        return PromptPolicy.polishPrompt(
+            basePrompt: model.prompt,
+            contextInstruction: contextInstruction
+        )
+    }
+
+    private func showConversationProfilePanel(
+        for snapshot: ConversationSnapshot,
+        title: String,
+        context: CapturedTextContext
+    ) {
+        model.isProcessing = true
+        model.statusText = "设置聊天对象…"
+        let insertionPoint = textService.insertionPointScreenRect(for: context)
+        conversationProfilePanel.show(
+            conversationTitle: title,
+            at: insertionPoint
+        ) { [weak self] decision in
+            self?.handleConversationProfileDecision(
+                decision,
+                snapshot: snapshot,
+                context: context
+            )
+        }
+    }
+
+    private func handleConversationProfileDecision(
+        _ decision: ConversationProfilePanel.Decision,
+        snapshot: ConversationSnapshot,
+        context: CapturedTextContext
+    ) {
+        guard model.isProcessing else { return }
+        if case .cancel = decision {
+            resetAfterCancelledConversationSelection()
+            return
+        }
+        guard conversationResolver.isTargetOrPoleFrontmost(snapshot) else {
+            cancelForChangedConversation()
+            return
+        }
+
+        conversationResolver.reactivate(snapshot)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            guard let self, self.model.isProcessing else { return }
+            guard self.conversationResolver.matchesCurrentConversation(snapshot) else {
+                self.cancelForChangedConversation()
+                return
+            }
+            guard self.textService.isCurrent(context) else {
+                self.cancelForChangedText()
+                return
+            }
+
+            switch decision {
+            case .save(let role, let instruction):
+                guard let profile = self.model.conversationProfiles.createProfile(
+                    for: snapshot,
+                    role: role,
+                    customInstruction: instruction
+                ) else {
+                    self.cancelForChangedConversation()
+                    return
+                }
+                self.beginRewrite(
+                    context: context,
+                    action: .polish,
+                    prompt: self.polishPrompt(
+                        for: snapshot,
+                        conversationInstruction: profile.modelInstruction
+                    ),
+                    conversationSnapshot: snapshot
+                )
+            case .useGeneric:
+                self.beginRewrite(
+                    context: context,
+                    action: .polish,
+                    prompt: self.polishPrompt(for: snapshot),
+                    conversationSnapshot: snapshot
+                )
+            case .cancel:
+                self.resetAfterCancelledConversationSelection()
+            }
+        }
+    }
+
+    private func beginRewrite(
+        context: CapturedTextContext,
+        action: RewriteAction,
+        prompt: String,
+        conversationSnapshot: ConversationSnapshot?
+    ) {
         model.isProcessing = true
         model.statusText = action.promptDescription
         let insertionPoint = textService.insertionPointScreenRect(for: context)
-        inputProgressIndicator.show(at: insertionPoint)
+        inputProgressIndicator.show(
+            at: insertionPoint,
+            operation: action == .translate ? .translation : .optimization
+        )
 
         let key = model.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let selectedModel = model.modelName
-        let prompt = action == .translate ? TranslationPolicy.prompt : model.prompt
 
         Task { [weak self] in
             guard let self else { return }
@@ -214,6 +403,10 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                     prompt: prompt
                 )
                 try await MainActor.run {
+                    if let conversationSnapshot,
+                       !self.conversationResolver.matchesCurrentConversation(conversationSnapshot) {
+                        throw ConversationContextError.changed
+                    }
                     let outcome = OptimizationOutcome.classify(
                         sourceText: context.sourceText,
                         result: result
@@ -221,12 +414,6 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                     try self.textService.replace(context: context, with: result)
                     let finalCursorUTF16 = context.replacementRange.location
                         + (result as NSString).length
-                    self.inputProgressIndicator.move(
-                        to: self.textService.insertionPointScreenRect(
-                            for: context,
-                            cursorUTF16: finalCursorUTF16
-                        )
-                    )
                     self.pendingCompletion = PendingCompletion(
                         context: context,
                         cursorUTF16: finalCursorUTF16,
@@ -236,7 +423,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                     self.perform(
                         #selector(self.finishPendingCompletion),
                         with: nil,
-                        afterDelay: 0.06
+                        afterDelay: 0.08
                     )
                 }
             } catch {
@@ -247,14 +434,33 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         object: nil
                     )
                     self.pendingCompletion = nil
-                    self.inputProgressIndicator.hide()
+                    self.inputProgressIndicator.fail()
                     self.model.isProcessing = false
-                    self.model.statusText = self.model.isEnabled
-                        ? self.readyStatusText
-                        : "已暂停"
+                    if let conversationError = error as? ConversationContextError {
+                        self.model.statusText = conversationError.localizedDescription
+                    } else {
+                        self.model.statusText = self.model.isEnabled
+                            ? self.readyStatusText
+                            : "已暂停"
+                    }
                 }
             }
         }
+    }
+
+    private func resetAfterCancelledConversationSelection() {
+        model.isProcessing = false
+        model.statusText = model.isEnabled ? readyStatusText : "已暂停"
+    }
+
+    private func cancelForChangedConversation() {
+        model.isProcessing = false
+        model.statusText = ConversationContextError.changed.localizedDescription
+    }
+
+    private func cancelForChangedText() {
+        model.isProcessing = false
+        model.statusText = TextEditingError.textChangedWhileWaiting.localizedDescription
     }
 
     @objc private func finishPendingCompletion() {
@@ -265,13 +471,15 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                 for: completion.context,
                 cursorUTF16: completion.cursorUTF16
             )
-        )
-        inputProgressIndicator.finish(
-            with: completion.outcome,
-            operation: completion.action == .translate ? .translation : .optimization
-        )
-        model.isProcessing = false
-        model.statusText = model.isEnabled ? readyStatusText : "已暂停"
+        ) { [weak self] in
+            guard let self, self.model.isProcessing else { return }
+            self.inputProgressIndicator.finish(
+                with: completion.outcome,
+                operation: completion.action == .translate ? .translation : .optimization
+            )
+            self.model.isProcessing = false
+            self.model.statusText = self.model.isEnabled ? self.readyStatusText : "已暂停"
+        }
     }
 
     private func showError(_ message: String) {
