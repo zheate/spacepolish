@@ -124,6 +124,48 @@ enum TextCommitPlanner {
     }
 }
 
+enum KeyboardTextCommitPlanner {
+    static func plan(
+        currentText: String,
+        capturedText: String,
+        sourceRange: NSRange,
+        replacement: String
+    ) throws -> TextCommitPlan {
+        if currentText == capturedText {
+            return try TextCommitPlanner.plan(
+                currentText: currentText,
+                capturedText: capturedText,
+                sourceRange: sourceRange,
+                replacement: replacement
+            )
+        }
+
+        let capturedLength = (capturedText as NSString).length
+        let isWholeField = sourceRange.location == 0 && sourceRange.length == capturedLength
+        guard isWholeField,
+              normalizedClipboardText(currentText) == normalizedClipboardText(capturedText) else {
+            throw TextEditingError.textChangedWhileWaiting
+        }
+
+        return TextCommitPlan(
+            updatedText: replacement,
+            replacementRange: NSRange(location: 0, length: (currentText as NSString).length),
+            cursorUTF16: (replacement as NSString).length
+        )
+    }
+
+    private static func normalizedClipboardText(_ text: String) -> String {
+        text.precomposedStringWithCanonicalMapping
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .replacingOccurrences(of: "\u{2028}", with: "\n")
+            .replacingOccurrences(of: "\u{2029}", with: "\n")
+            .replacingOccurrences(of: "\u{FEFF}", with: "")
+            .replacingOccurrences(of: "\u{200B}", with: "")
+            .replacingOccurrences(of: "\u{2060}", with: "")
+    }
+}
+
 enum KeyboardFallbackPolicy {
     private static let excludedBundleIdentifiers: Set<String> = [
         "com.spacepolish.mac",
@@ -800,7 +842,7 @@ private enum KeyboardTextFallback {
         processIdentifier: pid_t
     ) throws {
         let current = try readAllText(processIdentifier: processIdentifier)
-        let commit = try TextCommitPlanner.plan(
+        let commit = try KeyboardTextCommitPlanner.plan(
             currentText: current,
             capturedText: context.capturedText,
             sourceRange: context.replacementRange,

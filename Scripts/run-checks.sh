@@ -11,10 +11,15 @@ swiftc \
     -framework AppKit \
     -framework ApplicationServices \
     -framework Vision \
+    -framework Security \
     Sources/Pole/DoubleOptionMonitor.swift \
     Sources/Pole/QwenClient.swift \
+    Sources/Pole/KeychainStore.swift \
     Sources/Pole/ApplicationContext.swift \
     Sources/Pole/PromptPolicy.swift \
+    Sources/Pole/CommunicationIntelligence.swift \
+    Sources/Pole/ExternalConversationHelper.swift \
+    Sources/Pole/RewriteGuards.swift \
     Sources/Pole/InputProgressIndicator.swift \
     Sources/Pole/ConversationContext.swift \
     Sources/Pole/TextEditing.swift \

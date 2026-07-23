@@ -890,3 +890,5 @@ final class ConversationResolver {
         return axValue
     }
 }
+
+extension ConversationResolver: CurrentConversationContextProvider {}

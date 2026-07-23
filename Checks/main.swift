@@ -21,6 +21,37 @@ private func expectThrow(_ name: String, _ operation: () throws -> Void) {
     }
 }
 
+private final class AsyncResultBox<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: Result<T, Error>?
+
+    func set(_ result: Result<T, Error>) {
+        lock.lock()
+        storage = result
+        lock.unlock()
+    }
+
+    func get() -> Result<T, Error>? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+}
+
+private func waitForAsync<T>(
+    _ operation: @escaping @Sendable () async throws -> T
+) -> Result<T, Error> {
+    let semaphore = DispatchSemaphore(value: 0)
+    let box = AsyncResultBox<T>()
+    Task.detached {
+        do { box.set(.success(try await operation())) }
+        catch { box.set(.failure(error)) }
+        semaphore.signal()
+    }
+    semaphore.wait()
+    return box.get()!
+}
+
 do {
     let input = "这个表达有一点不太好"
     let plan = try TextRangePlanner.plan(
@@ -154,6 +185,43 @@ expectThrow("等待期间真实编辑仍拒绝覆盖") {
         capturedText: rewrite.capturedText,
         sourceRange: rewrite.replacementRange,
         replacement: "优化后的文字"
+    )
+}
+
+do {
+    let captured = "第一行\r\n第二行\u{200B}"
+    let current = "第一行\n第二行"
+    let commit = try KeyboardTextCommitPlanner.plan(
+        currentText: current,
+        capturedText: captured,
+        sourceRange: NSRange(location: 0, length: (captured as NSString).length),
+        replacement: "优化结果"
+    )
+    check(commit.updatedText == "优化结果", "键盘回退允许微信等价换行和零宽占位差异")
+    check(
+        commit.replacementRange == NSRange(location: 0, length: (current as NSString).length),
+        "等价全文写回使用当前输入框的真实范围"
+    )
+} catch {
+    failures += 1
+    print("FAIL  键盘回退等价文本提交抛出异常：\(error)")
+}
+
+expectThrow("键盘回退仍拒绝真实文字变化") {
+    _ = try KeyboardTextCommitPlanner.plan(
+        currentText: "用户补充了新内容",
+        capturedText: "原文",
+        sourceRange: NSRange(location: 0, length: 2),
+        replacement: "优化结果"
+    )
+}
+
+expectThrow("键盘回退选区模式不放宽文本一致性") {
+    _ = try KeyboardTextCommitPlanner.plan(
+        currentText: "前文\n后文",
+        capturedText: "前文\r\n后文",
+        sourceRange: NSRange(location: 0, length: 2),
+        replacement: "优化"
     )
 }
 
@@ -830,6 +898,429 @@ check(
     !ocrConversationSnapshot.matchesForWriteback(switchedWindowSnapshot),
     "轻量校验发现窗口变化时仍拒绝写回"
 )
+
+let managerMessages = [
+    ConversationMessage(id: "1", conversationID: "c1", timestamp: Date(), direction: .received, senderID: "other", kind: .text, text: "这个项目什么时候完成？尽快再看一下"),
+    ConversationMessage(id: "2", conversationID: "c1", timestamp: Date(), direction: .sent, senderID: "self", kind: .text, text: "收到，我调整后同步进展"),
+    ConversationMessage(id: "3", conversationID: "c1", timestamp: Date(), direction: .received, senderID: "other", kind: .text, text: "方案改一下，明天汇报"),
+    ConversationMessage(id: "4", conversationID: "c1", timestamp: Date(), direction: .sent, senderID: "self", kind: .text, text: "好的，我先确认需求和排期"),
+    ConversationMessage(id: "5", conversationID: "c1", timestamp: Date(), direction: .sent, senderID: "self", kind: .text, text: "收到，我同步一下项目进度")
+]
+let managerAnalysis = RelationshipAnalyzer.analyze(title: "直属领导", messages: managerMessages)
+check(managerAnalysis.role == .manager, "历史互动与明确称谓可识别上级关系")
+check(managerAnalysis.confidence >= 0.70, "充分关系证据达到自动绑定阈值")
+
+let friendMessages = (0..<6).map {
+    ConversationMessage(
+        id: "f\($0)",
+        conversationID: "friend",
+        timestamp: Date(),
+        direction: $0.isMultiple(of: 2) ? .sent : .received,
+        senderID: nil,
+        kind: .text,
+        text: $0.isMultiple(of: 2) ? "哈哈可以，周末一起吃饭😂" : "笑死，晚安啦🤣"
+    )
+}
+check(
+    RelationshipAnalyzer.analyze(title: "老婆", messages: friendMessages).role == .friendOrFamily,
+    "亲密称谓与休闲互动可识别朋友家人关系"
+)
+
+let learnedVoice = VoiceAnalyzer.metrics(from: ["收到，我先确认一下", "可以，我这边推进", "好的，稍后同步"])
+check(learnedVoice.styleMarkers.contains("同步") || learnedVoice.styleMarkers.contains("确认"), "声音画像只提取允许的语气标记")
+check(!learnedVoice.styleMarkers.contains("项目"), "声音画像不把内容名词当作风格")
+check(CommunicationIntentAnalyzer.infer(from: "麻烦帮我确认一下") == .request, "本地意图识别可识别请求")
+check(CommunicationIntentAnalyzer.infer(from: "抱歉，这次没有处理好") == .apologize, "本地意图识别可识别道歉")
+
+let fingerprintSample = PendingRewriteSample(
+    relationshipID: nil,
+    conversationID: "opaque",
+    rewrittenText: "这是只用于匹配的成稿内容"
+)
+if let encodedFingerprint = try? JSONEncoder().encode(fingerprintSample) {
+    check(
+        !String(decoding: encodedFingerprint, as: UTF8.self).contains("这是只用于匹配的成稿内容"),
+        "待匹配成稿只保存指纹而不保存正文"
+    )
+} else {
+    check(false, "待匹配成稿指纹可以编码")
+}
+
+let safeRewrite = StructuredRewriteResult(
+    rewrittenText: "项目可能延期两周，因为供应商接口还没完成。",
+    intent: .inform,
+    preservedClaims: ["可能延期两周", "供应商接口未完成"]
+)
+check(
+    FactGuard.audit(
+        sourceText: "项目可能延期两周，因为供应商接口还没完成。",
+        result: safeRewrite,
+        applicationRole: .messaging,
+        expansionRatio: 1.35
+    ).accepted,
+    "事实守卫接受忠实的小范围优化"
+)
+let certaintyRewrite = StructuredRewriteResult(
+    rewrittenText: "项目已经延期两周，因为供应商接口还没完成。",
+    intent: .inform,
+    preservedClaims: [],
+    certaintyChanges: ["可能改成已经"]
+)
+check(
+    !FactGuard.audit(
+        sourceText: "项目可能延期两周，因为供应商接口还没完成。",
+        result: certaintyRewrite,
+        applicationRole: .messaging,
+        expansionRatio: 1.35
+    ).accepted,
+    "事实守卫拒绝把可能改成已经"
+)
+let inventedRewrite = StructuredRewriteResult(
+    rewrittenText: "项目可能延期两周，我们会在周五完成备用方案。",
+    addedClaims: ["周五完成备用方案"]
+)
+check(
+    !FactGuard.audit(
+        sourceText: "项目可能延期两周。",
+        result: inventedRewrite,
+        applicationRole: .messaging,
+        expansionRatio: 1.35
+    ).accepted,
+    "事实守卫拒绝新增时间和行动承诺"
+)
+check(
+    !FactGuard.audit(
+        sourceText: "项目可能延期。",
+        result: StructuredRewriteResult(rewrittenText: "项目可能延期，因为供应商没有交付。"),
+        applicationRole: .messaging,
+        expansionRatio: 1.35
+    ).accepted,
+    "事实守卫不依赖模型自报也会拒绝新增原因"
+)
+check(
+    !FactGuard.audit(
+        sourceText: "先把报价发送给客户，再确认合同。",
+        result: StructuredRewriteResult(rewrittenText: "确认合同。"),
+        applicationRole: .messaging,
+        expansionRatio: 1.35
+    ).accepted,
+    "事实守卫拒绝删除对象、动作和先后关系"
+)
+check(
+    !FactGuard.audit(
+        sourceText: "这个问题还需要处理。",
+        result: StructuredRewriteResult(rewrittenText: "这个问题交给小王负责处理。"),
+        applicationRole: .messaging,
+        expansionRatio: 1.35
+    ).accepted,
+    "事实守卫拒绝擅自增加责任人"
+)
+let technicalRewrite = StructuredRewriteResult(rewrittenText: "请执行其他命令")
+check(
+    !FactGuard.audit(
+        sourceText: "git status\n/Users/zh/test/file.swift",
+        result: technicalRewrite,
+        applicationRole: .aiDevelopmentAssistant,
+        expansionRatio: 1.35
+    ).accepted,
+    "事实守卫要求逐字保留命令和路径"
+)
+check(
+    !FactGuard.audit(
+        sourceText: "运行 `swift run Pole --mode=safe`，保留 AES-GCM。",
+        result: StructuredRewriteResult(rewrittenText: "运行 Pole。"),
+        applicationRole: .development,
+        expansionRatio: 1.35
+    ).accepted,
+    "事实守卫要求逐字保留代码、参数和专业名词"
+)
+check(
+    !VoiceGuard.audit(
+        sourceText: "这个我再看看",
+        outputText: "尊敬的领导，我们高度重视此事项，后续将持续推进。",
+        expectedVoice: VoiceMetrics(),
+        applicationRole: .messaging
+    ).accepted,
+    "声音守卫拒绝模板化正式话术"
+)
+
+do {
+    let tempDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("pole-intelligence-check-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+    let vaultURL = tempDirectory.appendingPathComponent("vault.dat")
+    let defaults = UserDefaults(suiteName: "pole-check-\(UUID().uuidString)")!
+    let legacy = ConversationProfile(
+        applicationIdentifier: "com.tencent.xinWeChat",
+        conversationTitle: "张总",
+        role: .manager,
+        customInstruction: "保持简短"
+    )
+    let key = Data(repeating: 7, count: 32)
+    let store = CommunicationIntelligenceStore(
+        defaults: defaults,
+        legacyProfiles: [legacy],
+        fileURL: vaultURL,
+        encryptionKey: key
+    )
+    check(store.relationships.count == 1, "旧聊天对象画像迁移到智能画像库")
+    let encrypted = try Data(contentsOf: vaultURL)
+    check(!String(decoding: encrypted, as: UTF8.self).contains("张总"), "智能画像文件不会明文保存会话名称")
+    let reloaded = CommunicationIntelligenceStore(
+        defaults: defaults,
+        fileURL: vaultURL,
+        encryptionKey: key
+    )
+    check(reloaded.relationships.first?.role == .manager, "AES-GCM 画像库可以重新加载")
+    var changedProbabilities = RoleProbabilities()
+    changedProbabilities.customer = 0.86
+    changedProbabilities.manager = 0.18
+    let changedAnalysis = RelationshipAnalysis(
+        role: .customer,
+        probabilities: changedProbabilities,
+        confidence: 0.86,
+        evidence: ["对话转为合同与交付语境"],
+        dimensions: .defaults(for: .customer)
+    )
+    let migrationSnapshot = ConversationSnapshot(
+        applicationIdentifier: "com.tencent.xinWeChat",
+        processIdentifier: 42,
+        windowIdentifier: 12,
+        candidate: ConversationTitleCandidate(title: "张总", source: .windowTitle, confidence: 0.96)
+    )
+    let firstObservation = Date()
+    _ = reloaded.applyAnalysis(
+        changedAnalysis,
+        snapshot: migrationSnapshot,
+        conversationID: "c",
+        messages: [],
+        analyzedAt: firstObservation
+    )
+    _ = reloaded.applyAnalysis(
+        changedAnalysis,
+        snapshot: migrationSnapshot,
+        conversationID: "c",
+        messages: [],
+        analyzedAt: firstObservation.addingTimeInterval(86_401)
+    )
+    check(reloaded.relationships.first?.pendingChange?.observationCount == 2, "关系变化需要连续两次观察")
+    if let id = reloaded.relationships.first?.id { reloaded.confirmPendingChange(id: id) }
+    check(reloaded.relationships.first?.role == .customer, "关系变化只有确认后才生效")
+    let voiceMessages = [
+        ConversationMessage(id: "s1", conversationID: "c", timestamp: Date(), direction: .sent, senderID: nil, kind: .text, text: "哈哈，可以"),
+        ConversationMessage(id: "s2", conversationID: "c", timestamp: Date(), direction: .sent, senderID: nil, kind: .text, text: "行，我再看一下"),
+        ConversationMessage(id: "s3", conversationID: "c", timestamp: Date(), direction: .sent, senderID: nil, kind: .text, text: "好的，晚点同步"),
+        ConversationMessage(id: "r1", conversationID: "c", timestamp: Date(), direction: .received, senderID: nil, kind: .text, text: "您好，感谢您的理解与支持，敬请知悉")
+    ]
+    let stableAnalysis = RelationshipAnalysis(
+        role: .customer,
+        probabilities: changedProbabilities,
+        confidence: 0.86,
+        evidence: ["保持当前关系"],
+        dimensions: .defaults(for: .customer)
+    )
+    _ = reloaded.applyAnalysis(
+        stableAnalysis,
+        snapshot: migrationSnapshot,
+        conversationID: "c",
+        messages: voiceMessages,
+        analyzedAt: firstObservation.addingTimeInterval(172_802)
+    )
+    check(reloaded.voice.sampleCount == 3, "声音学习只统计本人已发送文本")
+    check(reloaded.voice.metrics.formality < 0.5, "收到的正式话术不会污染用户声音")
+    reloaded.resetVoice()
+    reloaded.clearAll()
+    check(reloaded.relationships.isEmpty, "全部智能数据可以清除")
+    check(!FileManager.default.fileExists(atPath: vaultURL.path), "清除智能数据会删除加密画像文件")
+    try? FileManager.default.removeItem(at: tempDirectory)
+} catch {
+    failures += 1
+    print("FAIL  加密画像检查抛出异常：\(error)")
+}
+
+do {
+    let tempDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("pole-helper-check-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+    let helperURL = tempDirectory.appendingPathComponent("fake-helper")
+    let script = """
+    #!/bin/sh
+    case "$1" in
+      capabilities)
+        printf '%s' '{"protocolVersion":1,"provider":"fixture","supportsSessions":true,"supportsHistory":true,"readOnly":true}'
+        ;;
+      sessions)
+        printf '%s' '{"protocolVersion":1,"status":"ok","sessions":[{"id":"one","title":"张总","type":"private","lastActivity":null},{"id":"two","title":"张总","type":"private","lastActivity":null}]}'
+        ;;
+      history)
+        printf '%s' '{"protocolVersion":1,"status":"ok","messages":[]}'
+        ;;
+    esac
+    """
+    try Data(script.utf8).write(to: helperURL)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helperURL.path)
+    let provider = ExternalHelperProvider(executableURL: helperURL)
+    switch waitForAsync({ try await provider.capabilities() }) {
+    case .success(let capabilities):
+        check(capabilities.readOnly && capabilities.protocolVersion == 1, "helper 能力协商接受只读协议 v1")
+    case .failure(let error):
+        failures += 1
+        print("FAIL  helper 能力协商：\(error)")
+    }
+    let helperSnapshot = ConversationSnapshot(
+        applicationIdentifier: "com.tencent.xinWeChat",
+        processIdentifier: 42,
+        windowIdentifier: 12,
+        candidate: ConversationTitleCandidate(title: "张总", source: .windowTitle, confidence: 0.96)
+    )
+    switch waitForAsync({ try await provider.resolveSession(for: helperSnapshot) }) {
+    case .success:
+        failures += 1
+        print("FAIL  helper 重名会话必须拒绝自动匹配")
+    case .failure(let error):
+        check((error as? ConversationHelperError) == .ambiguousSession, "helper 重名会话必须拒绝自动匹配")
+    }
+
+    let isoFormatter = ISO8601DateFormatter()
+    let recentTimestamp = isoFormatter.string(from: Date().addingTimeInterval(-60))
+    let staleTimestamp = isoFormatter.string(from: Date().addingTimeInterval(-40 * 86_400))
+    let historyURL = tempDirectory.appendingPathComponent("history-helper")
+    let historyJSON = """
+    {"protocolVersion":1,"status":"ok","messages":[
+      {"id":"old","conversationID":"c","timestamp":"\(staleTimestamp)","direction":"sent","senderID":null,"kind":"text","text":"陈旧分片"},
+      {"id":"image","conversationID":"c","timestamp":"\(recentTimestamp)","direction":"received","senderID":null,"kind":"image","text":"图片描述"},
+      {"id":"recent","conversationID":"c","timestamp":"\(recentTimestamp)","direction":"sent","senderID":null,"kind":"text","text":"最近文本"}
+    ]}
+    """
+    try Data("#!/bin/sh\nprintf '%s' '\(historyJSON)'".utf8).write(to: historyURL)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: historyURL.path)
+    switch waitForAsync({
+        try await ExternalHelperProvider(executableURL: historyURL).history(
+            conversationID: "c",
+            limit: 200,
+            days: 30
+        )
+    }) {
+    case .success(let messages):
+        check(messages.map(\.id) == ["recent"], "helper 历史会过滤陈旧分片和非文本消息")
+    case .failure(let error):
+        failures += 1
+        print("FAIL  helper 历史过滤：\(error)")
+    }
+
+    let malformedURL = tempDirectory.appendingPathComponent("malformed-helper")
+    try Data("#!/bin/sh\nprintf 'not-json'".utf8).write(to: malformedURL)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: malformedURL.path)
+    switch waitForAsync({ try await ExternalHelperProvider(executableURL: malformedURL).capabilities() }) {
+    case .success:
+        failures += 1
+        print("FAIL  helper 损坏 JSON 必须拒绝")
+    case .failure(let error):
+        check((error as? ConversationHelperError) == .invalidJSON, "helper 损坏 JSON 必须拒绝")
+    }
+
+    let incompatibleURL = tempDirectory.appendingPathComponent("incompatible-helper")
+    try Data("#!/bin/sh\nprintf '%s' '{\"protocolVersion\":2,\"provider\":\"fixture\",\"supportsSessions\":true,\"supportsHistory\":true,\"readOnly\":true}'".utf8).write(to: incompatibleURL)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: incompatibleURL.path)
+    switch waitForAsync({ try await ExternalHelperProvider(executableURL: incompatibleURL).capabilities() }) {
+    case .success:
+        failures += 1
+        print("FAIL  helper 未知协议版本必须拒绝")
+    case .failure(let error):
+        check((error as? ConversationHelperError) == .incompatibleProtocol(2), "helper 未知协议版本必须拒绝")
+    }
+
+    let writableURL = tempDirectory.appendingPathComponent("writable-helper")
+    try Data("#!/bin/sh\nprintf '%s' '{\"protocolVersion\":1,\"provider\":\"fixture\",\"supportsSessions\":true,\"supportsHistory\":true,\"readOnly\":false}'".utf8).write(to: writableURL)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: writableURL.path)
+    switch waitForAsync({ try await ExternalHelperProvider(executableURL: writableURL).capabilities() }) {
+    case .success:
+        failures += 1
+        print("FAIL  非只读 helper 必须拒绝")
+    case .failure(let error):
+        check((error as? ConversationHelperError) == .notReadOnly, "非只读 helper 必须拒绝")
+    }
+
+    let oversizedURL = tempDirectory.appendingPathComponent("oversized-helper")
+    try Data("#!/bin/sh\nprintf 'abcdefghijklmnopqrstuvwxyz'".utf8).write(to: oversizedURL)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: oversizedURL.path)
+    switch waitForAsync({
+        try await HelperProcessRunner().run(
+            executableURL: oversizedURL,
+            arguments: [],
+            timeout: 1,
+            maximumOutputBytes: 10
+        )
+    }) {
+    case .success:
+        failures += 1
+        print("FAIL  helper 超大输出必须拒绝")
+    case .failure(let error):
+        check((error as? ConversationHelperError) == .outputTooLarge, "helper 超大输出必须拒绝")
+    }
+
+    let failedURL = tempDirectory.appendingPathComponent("failed-helper")
+    try Data("#!/bin/sh\nprintf 'fixture error' >&2\nexit 3".utf8).write(to: failedURL)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: failedURL.path)
+    switch waitForAsync({
+        try await HelperProcessRunner().run(
+            executableURL: failedURL,
+            arguments: [],
+            timeout: 1,
+            maximumOutputBytes: 1_024
+        )
+    }) {
+    case .success:
+        failures += 1
+        print("FAIL  helper 异常退出必须拒绝")
+    case .failure(let error):
+        if let helperError = error as? ConversationHelperError,
+           case .nonzeroExit(let code, _) = helperError,
+           code == 3 {
+            check(true, "helper 异常退出必须拒绝")
+        } else {
+            check(false, "helper 异常退出必须拒绝")
+        }
+    }
+
+    let missingURL = tempDirectory.appendingPathComponent("missing-helper")
+    switch waitForAsync({
+        try await HelperProcessRunner().run(
+            executableURL: missingURL,
+            arguments: [],
+            timeout: 1,
+            maximumOutputBytes: 1_024
+        )
+    }) {
+    case .success:
+        failures += 1
+        print("FAIL  helper 缺失必须安全失败")
+    case .failure(let error):
+        check((error as? ConversationHelperError) == .missingExecutable, "helper 缺失必须安全失败")
+    }
+
+    let slowURL = tempDirectory.appendingPathComponent("slow-helper")
+    try Data("#!/bin/sh\nsleep 2\nprintf '{}'".utf8).write(to: slowURL)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: slowURL.path)
+    switch waitForAsync({
+        try await HelperProcessRunner().run(
+            executableURL: slowURL,
+            arguments: [],
+            timeout: 0.1,
+            maximumOutputBytes: 1_024
+        )
+    }) {
+    case .success:
+        failures += 1
+        print("FAIL  helper 超时必须终止")
+    case .failure(let error):
+        check((error as? ConversationHelperError) == .timedOut, "helper 超时必须终止")
+    }
+    try? FileManager.default.removeItem(at: tempDirectory)
+} catch {
+    failures += 1
+    print("FAIL  helper fixture 检查抛出异常：\(error)")
+}
 
 if failures > 0 {
     print("\n\(failures) 项检查失败")

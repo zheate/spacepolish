@@ -22,6 +22,11 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         let action: RewriteAction
     }
 
+    private struct RecentRewriteFeedbackContext {
+        let relationshipID: UUID?
+        let createdAt: Date
+    }
+
     let model = AppModel()
 
     private let client = QwenClient()
@@ -35,6 +40,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     private var settingsController: SettingsWindowController?
     private var isMonitorStarted = false
     private var pendingCompletion: PendingCompletion?
+    private var recentRewriteFeedbackContext: RecentRewriteFeedbackContext?
 
     override init() {
         super.init()
@@ -105,6 +111,24 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         settings.target = self
         menu.addItem(settings)
 
+        if let feedbackContext = recentRewriteFeedbackContext,
+           Date().timeIntervalSince(feedbackContext.createdAt) <= 86_400 {
+            let feedbackItem = NSMenuItem(title: "评价最近一次优化", action: nil, keyEquivalent: "")
+            let feedbackMenu = NSMenu()
+            for (index, feedback) in RewriteFeedback.allCases.enumerated() {
+                let item = NSMenuItem(
+                    title: feedback.displayName,
+                    action: #selector(applyRewriteFeedback(_:)),
+                    keyEquivalent: ""
+                )
+                item.target = self
+                item.tag = index
+                feedbackMenu.addItem(item)
+            }
+            feedbackItem.submenu = feedbackMenu
+            menu.addItem(feedbackItem)
+        }
+
         if !AccessibilityPermission.isTrusted {
             let permission = NSMenuItem(
                 title: "授予辅助功能权限…",
@@ -125,6 +149,16 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         model.isEnabled.toggle()
         try? model.save()
         model.statusText = model.isEnabled ? readyStatusText : "已暂停"
+    }
+
+    @objc private func applyRewriteFeedback(_ sender: NSMenuItem) {
+        guard RewriteFeedback.allCases.indices.contains(sender.tag),
+              let context = recentRewriteFeedbackContext else { return }
+        model.intelligence.applyFeedback(
+            RewriteFeedback.allCases[sender.tag],
+            relationshipID: context.relationshipID
+        )
+        model.statusText = "反馈已在本机学习"
     }
 
     @objc func openSettings() {
@@ -216,7 +250,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                 context: context,
                 action: .translate,
                 prompt: TranslationPolicy.prompt,
-                conversationSnapshot: nil
+                conversationSnapshot: nil,
+                communicationContext: nil
             )
         }
     }
@@ -225,59 +260,180 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         let snapshot = conversationResolver.resolveCurrentConversation()
         if let snapshot,
            !snapshot.applicationContext.supportsConversationProfiles {
-            beginRewrite(
-                context: context,
-                action: .polish,
-                prompt: polishPrompt(for: snapshot),
-                conversationSnapshot: snapshot
-            )
+            beginPolish(context: context, snapshot: snapshot, relationship: nil)
             return
         }
 
-        if let snapshot,
-           let profile = model.conversationProfiles.profile(for: snapshot) {
-            beginRewrite(
-                context: context,
-                action: .polish,
-                prompt: polishPrompt(
-                    for: snapshot,
-                    conversationInstruction: profile.modelInstruction
-                ),
-                conversationSnapshot: snapshot
-            )
+        guard let snapshot else {
+            beginPolish(context: context, snapshot: nil, relationship: nil)
             return
         }
 
-        if let snapshot,
-           let profile = model.conversationProfiles.createInferredProfile(for: snapshot) {
-            beginRewrite(
-                context: context,
-                action: .polish,
-                prompt: polishPrompt(
-                    for: snapshot,
-                    conversationInstruction: profile.modelInstruction
-                ),
-                conversationSnapshot: snapshot
-            )
+        let existing = model.intelligence.relationship(for: snapshot)
+        let needsRefresh = existing?.lastAnalyzedAt.map {
+            Date().timeIntervalSince($0) >= 86_400
+        } ?? true
+        if model.historyAnalysisEnabled,
+           needsRefresh,
+           model.helperURL != nil,
+           snapshot.normalizedTitle != nil {
+            prepareHistoryContext(context: context, snapshot: snapshot, fallback: existing)
             return
         }
-
-        if let snapshot,
-           snapshot.canCreateProfile,
-           let title = snapshot.title {
-            showConversationProfilePanel(
-                for: snapshot,
-                title: title,
-                context: context
-            )
+        if let existing {
+            beginPolish(context: context, snapshot: snapshot, relationship: existing)
             return
         }
+        if let inferred = model.intelligence.createInferredRelationship(for: snapshot) {
+            beginPolish(context: context, snapshot: snapshot, relationship: inferred)
+            return
+        }
+        requestRelationshipOrUseGeneric(context: context, snapshot: snapshot)
+    }
 
+    private func prepareHistoryContext(
+        context: CapturedTextContext,
+        snapshot: ConversationSnapshot,
+        fallback: RelationshipProfile?
+    ) {
+        guard let helperURL = model.helperURL else {
+            beginPolish(context: context, snapshot: snapshot, relationship: fallback)
+            return
+        }
+        model.isProcessing = true
+        model.statusText = "正在理解当前会话…"
+        inputProgressIndicator.show(
+            at: textService.insertionPointScreenRect(for: context),
+            operation: .optimization
+        )
+        let provider = ExternalHelperProvider(executableURL: helperURL)
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                _ = try await provider.capabilities()
+                let session = try await provider.resolveSession(for: snapshot)
+                let messages = try await provider.history(
+                    conversationID: session.id,
+                    limit: 200,
+                    days: 30
+                )
+                let analysis = RelationshipAnalyzer.analyze(
+                    title: snapshot.title,
+                    messages: messages
+                )
+                try await MainActor.run {
+                    guard self.conversationResolver.matchesCurrentConversation(snapshot) else {
+                        throw ConversationContextError.changed
+                    }
+                    guard self.textService.isCurrent(context) else {
+                        throw TextEditingError.textChangedWhileWaiting
+                    }
+                    self.model.helperStatusText = "已连接 · \(session.type)"
+                    let resolved = self.model.intelligence.applyAnalysis(
+                        analysis,
+                        snapshot: snapshot,
+                        conversationID: session.id,
+                        messages: messages
+                    ) ?? fallback
+                    if let resolved {
+                        self.beginPolish(
+                            context: context,
+                            snapshot: snapshot,
+                            relationship: resolved,
+                            progressAlreadyShown: true
+                        )
+                    } else {
+                        self.inputProgressIndicator.fail()
+                        self.model.isProcessing = false
+                        self.requestRelationshipOrUseGeneric(context: context, snapshot: snapshot)
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    if error is ConversationContextError {
+                        self.inputProgressIndicator.fail()
+                        self.cancelForChangedConversation()
+                        return
+                    }
+                    if error as? TextEditingError == .textChangedWhileWaiting {
+                        self.inputProgressIndicator.fail()
+                        self.cancelForChangedText()
+                        return
+                    }
+                    self.model.helperStatusText = "不可用，已降级"
+                    if let fallback {
+                        self.beginPolish(
+                            context: context,
+                            snapshot: snapshot,
+                            relationship: fallback,
+                            progressAlreadyShown: true
+                        )
+                    } else if let inferred = self.model.intelligence.createInferredRelationship(for: snapshot) {
+                        self.beginPolish(
+                            context: context,
+                            snapshot: snapshot,
+                            relationship: inferred,
+                            progressAlreadyShown: true
+                        )
+                    } else {
+                        self.inputProgressIndicator.fail()
+                        self.model.isProcessing = false
+                        self.requestRelationshipOrUseGeneric(context: context, snapshot: snapshot)
+                    }
+                }
+            }
+        }
+    }
+
+    private func requestRelationshipOrUseGeneric(
+        context: CapturedTextContext,
+        snapshot: ConversationSnapshot
+    ) {
+        if snapshot.canCreateProfile, let title = snapshot.title {
+            showConversationProfilePanel(for: snapshot, title: title, context: context)
+        } else {
+            beginPolish(context: context, snapshot: snapshot, relationship: nil)
+        }
+    }
+
+    private func beginPolish(
+        context: CapturedTextContext,
+        snapshot: ConversationSnapshot?,
+        relationship: RelationshipProfile?,
+        progressAlreadyShown: Bool = false
+    ) {
+        let voiceMetrics = model.intelligence.voice.metrics(for: relationship?.id)
+        let intent = CommunicationIntentAnalyzer.infer(from: context.sourceText)
+        let policy = CommunicationPolicy(
+            intent: intent,
+            relationshipRole: relationship?.role,
+            relationshipConfidence: relationship?.confidence ?? 0,
+            dimensions: relationship?.dimensions,
+            voice: voiceMetrics,
+            customInstruction: relationship?.anonymizedInstruction(),
+            messageExpansionRatio: model.intelligence.safety.preferredExpansionRatio
+        )
+        let applicationContext = snapshot?.applicationContext
+            ?? ApplicationContextClassifier.context(bundleIdentifier: "unknown")
+        let communicationContext = CommunicationContext(
+            applicationContext: applicationContext,
+            conversationSnapshot: snapshot,
+            relationship: relationship,
+            intent: intent,
+            voice: model.intelligence.voice,
+            policy: policy,
+            dataConfidence: relationship?.confidence ?? 0
+        )
         beginRewrite(
             context: context,
             action: .polish,
-            prompt: polishPrompt(for: snapshot),
-            conversationSnapshot: snapshot
+            prompt: polishPrompt(
+                for: snapshot,
+                conversationInstruction: policy.modelInstruction
+            ),
+            conversationSnapshot: snapshot,
+            communicationContext: communicationContext,
+            progressAlreadyShown: progressAlreadyShown
         )
     }
 
@@ -346,7 +502,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
 
             switch decision {
             case .save(let role, let instruction):
-                guard let profile = self.model.conversationProfiles.createProfile(
+                guard let profile = self.model.intelligence.createManualRelationship(
                     for: snapshot,
                     role: role,
                     customInstruction: instruction
@@ -354,22 +510,9 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                     self.cancelForChangedConversation()
                     return
                 }
-                self.beginRewrite(
-                    context: context,
-                    action: .polish,
-                    prompt: self.polishPrompt(
-                        for: snapshot,
-                        conversationInstruction: profile.modelInstruction
-                    ),
-                    conversationSnapshot: snapshot
-                )
+                self.beginPolish(context: context, snapshot: snapshot, relationship: profile)
             case .useGeneric:
-                self.beginRewrite(
-                    context: context,
-                    action: .polish,
-                    prompt: self.polishPrompt(for: snapshot),
-                    conversationSnapshot: snapshot
-                )
+                self.beginPolish(context: context, snapshot: snapshot, relationship: nil)
             case .cancel:
                 self.resetAfterCancelledConversationSelection()
             }
@@ -380,15 +523,19 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         context: CapturedTextContext,
         action: RewriteAction,
         prompt: String,
-        conversationSnapshot: ConversationSnapshot?
+        conversationSnapshot: ConversationSnapshot?,
+        communicationContext: CommunicationContext?,
+        progressAlreadyShown: Bool = false
     ) {
         model.isProcessing = true
         model.statusText = action.promptDescription
-        let insertionPoint = textService.insertionPointScreenRect(for: context)
-        inputProgressIndicator.show(
-            at: insertionPoint,
-            operation: action == .translate ? .translation : .optimization
-        )
+        if !progressAlreadyShown {
+            let insertionPoint = textService.insertionPointScreenRect(for: context)
+            inputProgressIndicator.show(
+                at: insertionPoint,
+                operation: action == .translate ? .translation : .optimization
+            )
+        }
 
         let key = model.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let selectedModel = model.modelName
@@ -396,12 +543,65 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         Task { [weak self] in
             guard let self else { return }
             do {
-                let result = try await self.client.optimize(
-                    text: context.sourceText,
-                    apiKey: key,
-                    model: selectedModel,
-                    prompt: prompt
-                )
+                let result: String
+                if action == .polish, let communicationContext {
+                    let first = try await self.client.optimizeStructured(
+                        text: context.sourceText,
+                        apiKey: key,
+                        model: selectedModel,
+                        prompt: prompt
+                    )
+                    let firstFactAudit = FactGuard.audit(
+                        sourceText: context.sourceText,
+                        result: first,
+                        applicationRole: communicationContext.applicationContext.role,
+                        expansionRatio: communicationContext.policy.messageExpansionRatio
+                    )
+                    let firstVoiceAudit = VoiceGuard.audit(
+                        sourceText: context.sourceText,
+                        outputText: first.rewrittenText,
+                        expectedVoice: communicationContext.policy.voice,
+                        applicationRole: communicationContext.applicationContext.role
+                    )
+                    if firstFactAudit.accepted, firstVoiceAudit.accepted {
+                        result = first.rewrittenText
+                    } else {
+                        let issues = firstFactAudit.issues + firstVoiceAudit.issues
+                        let retry = try await self.client.optimizeStructured(
+                            text: context.sourceText,
+                            apiKey: key,
+                            model: selectedModel,
+                            prompt: prompt,
+                            retryIssues: issues
+                        )
+                        let retryFactAudit = FactGuard.audit(
+                            sourceText: context.sourceText,
+                            result: retry,
+                            applicationRole: communicationContext.applicationContext.role,
+                            expansionRatio: communicationContext.policy.messageExpansionRatio
+                        )
+                        let retryVoiceAudit = VoiceGuard.audit(
+                            sourceText: context.sourceText,
+                            outputText: retry.rewrittenText,
+                            expectedVoice: communicationContext.policy.voice,
+                            applicationRole: communicationContext.applicationContext.role
+                        )
+                        if retryFactAudit.accepted, retryVoiceAudit.accepted {
+                            result = retry.rewrittenText
+                        } else {
+                            throw RewriteSafetyError.rejected(
+                                retryFactAudit.issues + retryVoiceAudit.issues
+                            )
+                        }
+                    }
+                } else {
+                    result = try await self.client.optimize(
+                        text: context.sourceText,
+                        apiKey: key,
+                        model: selectedModel,
+                        prompt: prompt
+                    )
+                }
                 try await MainActor.run {
                     if let conversationSnapshot,
                        !self.conversationResolver.matchesCurrentConversation(conversationSnapshot) {
@@ -412,6 +612,20 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         result: result
                     )
                     try self.textService.replace(context: context, with: result)
+                    if action == .polish {
+                        let relationshipID = communicationContext?.relationship?.id
+                        self.recentRewriteFeedbackContext = RecentRewriteFeedbackContext(
+                            relationshipID: relationshipID,
+                            createdAt: Date()
+                        )
+                        if self.model.rewriteLearningEnabled, result != context.sourceText {
+                            self.model.intelligence.recordPendingRewrite(
+                                text: result,
+                                relationshipID: relationshipID,
+                                conversationID: communicationContext?.relationship?.conversationID
+                            )
+                        }
+                    }
                     let finalCursorUTF16 = context.replacementRange.location
                         + (result as NSString).length
                     self.pendingCompletion = PendingCompletion(
@@ -436,13 +650,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                     self.pendingCompletion = nil
                     self.inputProgressIndicator.fail()
                     self.model.isProcessing = false
-                    if let conversationError = error as? ConversationContextError {
-                        self.model.statusText = conversationError.localizedDescription
-                    } else {
-                        self.model.statusText = self.model.isEnabled
-                            ? self.readyStatusText
-                            : "已暂停"
-                    }
+                    self.model.statusText = self.failureStatusText(for: error)
                 }
             }
         }
@@ -484,5 +692,21 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
 
     private func showError(_ message: String) {
         model.statusText = message
+    }
+
+    private func failureStatusText(for error: Error) -> String {
+        if let conversationError = error as? ConversationContextError {
+            return conversationError.localizedDescription
+        }
+        if let editingError = error as? TextEditingError {
+            return "上次失败：\(editingError.localizedDescription)"
+        }
+        if let safetyError = error as? RewriteSafetyError {
+            return "上次失败：\(safetyError.localizedDescription)"
+        }
+        if let qwenError = error as? QwenError {
+            return "上次失败：\(qwenError.localizedDescription)"
+        }
+        return "上次失败：\(error.localizedDescription)"
     }
 }
