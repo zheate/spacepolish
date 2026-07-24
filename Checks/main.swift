@@ -1015,6 +1015,29 @@ check(
     ).accepted,
     "事实守卫拒绝擅自增加责任人"
 )
+check(
+    FactGuard.audit(
+        sourceText: "项目可能延期两周。",
+        result: StructuredRewriteResult(
+            rewrittenText: "项目可能延期两周。",
+            addedClaims: ["模型认为这句话包含新增事实"],
+            certaintyChanges: ["模型认为确定程度发生变化"]
+        ),
+        applicationRole: .messaging,
+        expansionRatio: 1.35
+    ).accepted,
+    "事实守卫不把模型自报字段当作硬拒绝依据"
+)
+do {
+    let decoded = try JSONDecoder().decode(
+        StructuredRewriteResult.self,
+        from: Data(#"{"rewrittenText":"保留结果","intent":"unexpected-intent"}"#.utf8)
+    )
+    check(decoded.rewrittenText == "保留结果" && decoded.intent == .unknown, "结构化结果容忍未知意图")
+} catch {
+    failures += 1
+    print("FAIL 结构化结果未知意图抛出异常：\(error)")
+}
 let technicalRewrite = StructuredRewriteResult(rewrittenText: "请执行其他命令")
 check(
     !FactGuard.audit(

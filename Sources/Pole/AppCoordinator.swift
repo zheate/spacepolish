@@ -544,12 +544,16 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             guard let self else { return }
             do {
                 let result: String
-                if action == .polish, let communicationContext {
-                    let first = try await self.client.optimizeStructured(
-                        text: context.sourceText,
-                        apiKey: key,
-                        model: selectedModel,
-                        prompt: prompt
+                if action == .polish,
+                   let communicationContext,
+                   communicationContext.applicationContext.role == .messaging {
+                    let first = StructuredRewriteResult(
+                        rewrittenText: try await self.client.optimize(
+                            text: context.sourceText,
+                            apiKey: key,
+                            model: selectedModel,
+                            prompt: prompt
+                        )
                     )
                     let firstFactAudit = FactGuard.audit(
                         sourceText: context.sourceText,
@@ -567,12 +571,14 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         result = first.rewrittenText
                     } else {
                         let issues = firstFactAudit.issues + firstVoiceAudit.issues
-                        let retry = try await self.client.optimizeStructured(
-                            text: context.sourceText,
-                            apiKey: key,
-                            model: selectedModel,
-                            prompt: prompt,
-                            retryIssues: issues
+                        let retry = StructuredRewriteResult(
+                            rewrittenText: try await self.client.optimize(
+                                text: context.sourceText,
+                                apiKey: key,
+                                model: selectedModel,
+                                prompt: prompt,
+                                retryIssues: issues
+                            )
                         )
                         let retryFactAudit = FactGuard.audit(
                             sourceText: context.sourceText,

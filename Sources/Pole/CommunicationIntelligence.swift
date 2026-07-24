@@ -309,8 +309,8 @@ struct CommunicationPolicy: Codable, Equatable {
 
     var modelInstruction: String {
         var lines = [
-            "请保持用户原有的短句、分句、标点和自然口吻，让结果像用户本人更成熟的一版，而不是换成另一种人格。",
-            String(format: "目标直接度 %.2f，正式度 %.2f，详细度 %.2f。", voice.directness, voice.formality, voice.detail),
+            "只做最小必要修改：有明确的清晰度、准确性或自然度提升时再调整；不要为了变化而改写。",
+            "保持用户原有的短句、分句、标点和自然口吻，让结果像用户本人更成熟的一版，而不是换成另一种人格。",
             "禁止补充原文没有的事实、原因、时间、承诺、行动、责任人或结论。"
         ]
         if intent != .unknown {

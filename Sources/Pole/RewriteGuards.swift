@@ -32,7 +32,8 @@ struct StructuredRewriteResult: Codable, Equatable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         rewrittenText = try container.decode(String.self, forKey: .rewrittenText)
-        intent = try container.decodeIfPresent(CommunicationIntent.self, forKey: .intent) ?? .unknown
+        let rawIntent = try container.decodeIfPresent(String.self, forKey: .intent)
+        intent = rawIntent.flatMap(CommunicationIntent.init(rawValue:)) ?? .unknown
         preservedClaims = try container.decodeIfPresent([String].self, forKey: .preservedClaims) ?? []
         addedClaims = try container.decodeIfPresent([String].self, forKey: .addedClaims) ?? []
         certaintyChanges = try container.decodeIfPresent([String].self, forKey: .certaintyChanges) ?? []
@@ -117,12 +118,10 @@ enum FactGuard {
             issues.append("缺少受保护内容：\(token)")
         }
 
-        if !result.addedClaims.filter({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }).isEmpty {
-            issues.append("模型报告存在新增事实")
-        }
-        if !result.certaintyChanges.filter({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }).isEmpty {
-            issues.append("模型报告存在确定性变化")
-        }
+        // The model's claim report is advisory metadata, not evidence. The
+        // deterministic checks below must decide whether the rewritten text is
+        // safe; otherwise an honest self-report can reject an otherwise valid
+        // rewrite, while an incorrect self-report would not improve safety.
 
         if containsAny(negativeMarkers, in: sourceText), !containsAny(negativeMarkers, in: output) {
             issues.append("否定关系可能被删除")

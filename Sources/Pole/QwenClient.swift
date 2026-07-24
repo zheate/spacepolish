@@ -12,7 +12,8 @@ struct QwenClient {
         text: String,
         apiKey: String,
         model: String,
-        prompt: String
+        prompt: String,
+        retryIssues: [String] = []
     ) async throws -> String {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
@@ -24,13 +25,16 @@ struct QwenClient {
             ChatRequest(
                 model: model,
                 messages: [
-                    Message(role: "system", content: prompt),
+                    Message(
+                        role: "system",
+                        content: Self.promptWithRetryIssues(prompt, retryIssues: retryIssues)
+                    ),
                     Message(role: "user", content: text)
                 ],
                 stream: false,
                 temperature: Self.temperature,
                 enableThinking: Self.enableThinking,
-                maxCompletionTokens: 2_048,
+                maxCompletionTokens: Self.maxCompletionTokens(for: text),
                 responseFormat: nil
             )
         )
@@ -68,29 +72,12 @@ struct QwenClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
 
-        let correction: String
-        if retryIssues.isEmpty {
-            correction = ""
-        } else {
-            correction = """
-
-            上一次候选未通过本地安全检查。必须修正以下问题，不能用解释代替改写：
-            \(retryIssues.map { "- \($0)" }.joined(separator: "\n"))
-            """
-        }
         let structuredPrompt = """
-        \(prompt)
-        \(correction)
+        \(Self.promptWithRetryIssues(prompt, retryIssues: retryIssues))
 
-        以 JSON 对象返回，必须严格使用以下字段：
-        {
-          "rewrittenText": "可直接写回的唯一改写结果",
-          "intent": "inform|request|apologize|persuade|negotiate|reject|thank|complain|casual|unknown",
-          "preservedClaims": ["原文中被完整保留的事实"],
-          "addedClaims": ["相对原文新增的事实；没有则为空数组"],
-          "certaintyChanges": ["可能、预计、已经、一定等确定性变化；没有则为空数组"]
-        }
-        不要在 JSON 外输出任何内容。addedClaims 和 certaintyChanges 必须如实自检；目标是让两者都为空数组。
+        只返回一个 JSON 对象，必须包含唯一字段：
+        {"rewrittenText":"可直接写回的唯一改写结果"}
+        不要在 JSON 外输出内容，不要输出分析、理由、事实清单或自评字段。
         """
         request.httpBody = try JSONEncoder().encode(
             ChatRequest(
@@ -102,7 +89,7 @@ struct QwenClient {
                 stream: false,
                 temperature: Self.temperature,
                 enableThinking: Self.enableThinking,
-                maxCompletionTokens: 2_048,
+                maxCompletionTokens: Self.maxCompletionTokens(for: text),
                 responseFormat: ResponseFormat(type: "json_object")
             )
         )
@@ -150,6 +137,25 @@ struct QwenClient {
         guard lines.count >= 3 else { return trimmed }
         return lines.dropFirst().dropLast().joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func promptWithRetryIssues(
+        _ prompt: String,
+        retryIssues: [String]
+    ) -> String {
+        guard !retryIssues.isEmpty else { return prompt }
+        return """
+        \(prompt)
+
+        上一次候选未通过本地安全检查。必须修正以下问题，不能用解释代替改写：
+        \(retryIssues.map { "- \($0)" }.joined(separator: "\n"))
+        """
+    }
+
+    private static func maxCompletionTokens(for text: String) -> Int {
+        // Keep short chat messages from reserving an unnecessarily large output
+        // budget, while allowing longer pasted text to preserve its full result.
+        min(2_048, max(256, text.count * 2 + 128))
     }
 }
 
