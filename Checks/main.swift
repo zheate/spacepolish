@@ -489,6 +489,22 @@ check(
     "明显改写归类为完整优化"
 )
 check(
+    QwenClient.requestTimeout(for: "短消息", isRetry: false) == 20,
+    "短消息首轮请求使用较短超时"
+)
+check(
+    QwenClient.requestTimeout(for: "短消息", isRetry: true) >= 12
+        && QwenClient.requestTimeout(for: "短消息", isRetry: true) < 20,
+    "短消息纠错重试不会再次等待完整首轮超时"
+)
+check(
+    QwenClient.requestTimeout(
+        for: String(repeating: "长", count: 1_500),
+        isRetry: false
+    ) == 45,
+    "长文本保留完整请求超时"
+)
+check(
     InputProgressMotionPolicy.style(
         from: CGPoint(x: 100, y: 100),
         to: CGPoint(x: 124, y: 102),
@@ -593,8 +609,12 @@ check(
     ApplicationContextPolicy.contextInstruction(
         for: messagingApplicationContext,
         conversationInstruction: nil
-    )?.contains("礼貌不等于正式") == true,
-    "聊天客户端始终使用自然即时消息规则"
+    ).map {
+        $0.contains("礼貌不等于正式")
+            && $0.contains("有明确提升空间时至少完成一处有效修改")
+            && !$0.contains("只调整确实影响理解或流畅度的部分")
+    } == true,
+    "聊天客户端使用主动且自然的即时消息规则"
 )
 let messagingPrompt = PromptPolicy.polishPrompt(
     basePrompt: "基础规则",
@@ -609,6 +629,22 @@ check(
     "客户礼貌规则不会把微信改成正式话术"
 )
 check(!TranslationPolicy.prompt.contains("AI 开发助手"), "翻译提示词不携带应用场景规则")
+
+let neutralCommunicationPolicy = CommunicationPolicy(
+    intent: .unknown,
+    relationshipRole: nil,
+    relationshipConfidence: 0,
+    dimensions: nil,
+    voice: VoiceMetrics(),
+    customInstruction: nil,
+    messageExpansionRatio: 1.35
+)
+check(
+    neutralCommunicationPolicy.modelInstruction.contains("至少完成一处具体改进")
+        && neutralCommunicationPolicy.modelInstruction.contains("只有原文已经自然准确时才保持不变")
+        && !neutralCommunicationPolicy.modelInstruction.contains("只做最小必要修改"),
+    "沟通策略不会抵消主动优化规则"
+)
 
 check(
     ConversationTitleNormalizer.normalize("  张  总\n") == "张 总",

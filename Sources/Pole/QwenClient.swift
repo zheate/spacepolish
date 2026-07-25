@@ -17,7 +17,10 @@ struct QwenClient {
     ) async throws -> String {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        request.timeoutInterval = 45
+        request.timeoutInterval = Self.requestTimeout(
+            for: text,
+            isRetry: !retryIssues.isEmpty
+        )
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
 
@@ -68,7 +71,10 @@ struct QwenClient {
     ) async throws -> StructuredRewriteResult {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        request.timeoutInterval = 45
+        request.timeoutInterval = Self.requestTimeout(
+            for: text,
+            isRetry: !retryIssues.isEmpty
+        )
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
 
@@ -155,7 +161,21 @@ struct QwenClient {
     private static func maxCompletionTokens(for text: String) -> Int {
         // Keep short chat messages from reserving an unnecessarily large output
         // budget, while allowing longer pasted text to preserve its full result.
-        min(2_048, max(256, text.count * 2 + 128))
+        min(2_048, max(128, text.count * 2 + 64))
+    }
+
+    static func requestTimeout(for text: String, isRetry: Bool) -> TimeInterval {
+        let initialTimeout: TimeInterval
+        switch text.count {
+        case ...280:
+            initialTimeout = 20
+        case ...1_200:
+            initialTimeout = 30
+        default:
+            initialTimeout = 45
+        }
+        guard isRetry else { return initialTimeout }
+        return max(12, initialTimeout * 2 / 3)
     }
 }
 

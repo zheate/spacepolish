@@ -13,6 +13,15 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                 return "正在翻译…"
             }
         }
+
+        var performanceName: String {
+            switch self {
+            case .polish:
+                return "polish"
+            case .translate:
+                return "translate"
+            }
+        }
     }
 
     private struct PendingCompletion {
@@ -20,11 +29,16 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         let cursorUTF16: Int
         let outcome: OptimizationOutcome
         let action: RewriteAction
+        let retried: Bool
     }
 
     private struct RecentRewriteFeedbackContext {
         let relationshipID: UUID?
         let createdAt: Date
+    }
+
+    private final class RewriteAttemptState: @unchecked Sendable {
+        var retried = false
     }
 
     let model = AppModel()
@@ -41,6 +55,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     private var isMonitorStarted = false
     private var pendingCompletion: PendingCompletion?
     private var recentRewriteFeedbackContext: RecentRewriteFeedbackContext?
+    private var activePerformanceTrace: RewritePerformanceTrace?
 
     override init() {
         super.init()
@@ -235,13 +250,21 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         }
         guard !model.isProcessing else { return }
 
+        let trace = RewritePerformanceTrace(action: action.performanceName)
+        activePerformanceTrace = trace
+        let captureStartedAt = RewritePerformanceTrace.timestamp()
         let context: CapturedTextContext
         do {
             context = try textService.captureTargetText()
         } catch {
+            trace.record(.capture, since: captureStartedAt)
+            trace.finish(outcome: "capture_failed", retried: false)
+            activePerformanceTrace = nil
             model.statusText = model.isEnabled ? readyStatusText : "已暂停"
             return
         }
+        trace.setInputLength(context.sourceText.count)
+        trace.record(.capture, since: captureStartedAt)
 
         if action == .polish {
             handlePolishTrigger(context: context)
@@ -257,7 +280,12 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     }
 
     private func handlePolishTrigger(context: CapturedTextContext) {
+        let contextStartedAt = RewritePerformanceTrace.timestamp()
         let snapshot = conversationResolver.resolveCurrentConversation()
+        activePerformanceTrace?.record(
+            .conversationContext,
+            since: contextStartedAt
+        )
         if let snapshot,
            !snapshot.applicationContext.supportsConversationProfiles {
             beginPolish(context: context, snapshot: snapshot, relationship: nil)
@@ -307,6 +335,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             operation: .optimization
         )
         let provider = ExternalHelperProvider(executableURL: helperURL)
+        let historyStartedAt = RewritePerformanceTrace.timestamp()
         Task { [weak self] in
             guard let self else { return }
             do {
@@ -320,6 +349,10 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                 let analysis = RelationshipAnalyzer.analyze(
                     title: snapshot.title,
                     messages: messages
+                )
+                self.activePerformanceTrace?.record(
+                    .historyContext,
+                    since: historyStartedAt
                 )
                 try await MainActor.run {
                     guard self.conversationResolver.matchesCurrentConversation(snapshot) else {
@@ -350,6 +383,10 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                 }
             } catch {
                 await MainActor.run {
+                    self.activePerformanceTrace?.record(
+                        .historyContext,
+                        since: historyStartedAt
+                    )
                     if error is ConversationContextError {
                         self.inputProgressIndicator.fail()
                         self.cancelForChangedConversation()
@@ -542,19 +579,23 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
 
         Task { [weak self] in
             guard let self else { return }
+            let attemptState = RewriteAttemptState()
             do {
                 let result: String
                 if action == .polish,
                    let communicationContext,
                    communicationContext.applicationContext.role == .messaging {
                     let first = StructuredRewriteResult(
-                        rewrittenText: try await self.client.optimize(
+                        rewrittenText: try await self.requestOptimization(
                             text: context.sourceText,
                             apiKey: key,
                             model: selectedModel,
-                            prompt: prompt
+                            prompt: prompt,
+                            retryIssues: [],
+                            stage: .firstModel
                         )
                     )
+                    let firstGuardStartedAt = RewritePerformanceTrace.timestamp()
                     let firstFactAudit = FactGuard.audit(
                         sourceText: context.sourceText,
                         result: first,
@@ -567,19 +608,26 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         expectedVoice: communicationContext.policy.voice,
                         applicationRole: communicationContext.applicationContext.role
                     )
+                    self.activePerformanceTrace?.record(
+                        .firstGuard,
+                        since: firstGuardStartedAt
+                    )
                     if firstFactAudit.accepted, firstVoiceAudit.accepted {
                         result = first.rewrittenText
                     } else {
+                        attemptState.retried = true
                         let issues = firstFactAudit.issues + firstVoiceAudit.issues
                         let retry = StructuredRewriteResult(
-                            rewrittenText: try await self.client.optimize(
+                            rewrittenText: try await self.requestOptimization(
                                 text: context.sourceText,
                                 apiKey: key,
                                 model: selectedModel,
                                 prompt: prompt,
-                                retryIssues: issues
+                                retryIssues: issues,
+                                stage: .retryModel
                             )
                         )
+                        let retryGuardStartedAt = RewritePerformanceTrace.timestamp()
                         let retryFactAudit = FactGuard.audit(
                             sourceText: context.sourceText,
                             result: retry,
@@ -592,6 +640,10 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                             expectedVoice: communicationContext.policy.voice,
                             applicationRole: communicationContext.applicationContext.role
                         )
+                        self.activePerformanceTrace?.record(
+                            .retryGuard,
+                            since: retryGuardStartedAt
+                        )
                         if retryFactAudit.accepted, retryVoiceAudit.accepted {
                             result = retry.rewrittenText
                         } else {
@@ -601,14 +653,17 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         }
                     }
                 } else {
-                    result = try await self.client.optimize(
+                    result = try await self.requestOptimization(
                         text: context.sourceText,
                         apiKey: key,
                         model: selectedModel,
-                        prompt: prompt
+                        prompt: prompt,
+                        retryIssues: [],
+                        stage: .firstModel
                     )
                 }
                 try await MainActor.run {
+                    let writebackStartedAt = RewritePerformanceTrace.timestamp()
                     if let conversationSnapshot,
                        !self.conversationResolver.matchesCurrentConversation(conversationSnapshot) {
                         throw ConversationContextError.changed
@@ -638,7 +693,12 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         context: context,
                         cursorUTF16: finalCursorUTF16,
                         outcome: outcome,
-                        action: action
+                        action: action,
+                        retried: attemptState.retried
+                    )
+                    self.activePerformanceTrace?.record(
+                        .writeback,
+                        since: writebackStartedAt
                     )
                     self.perform(
                         #selector(self.finishPendingCompletion),
@@ -657,22 +717,58 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                     self.inputProgressIndicator.fail()
                     self.model.isProcessing = false
                     self.model.statusText = self.failureStatusText(for: error)
+                    self.activePerformanceTrace?.finish(
+                        outcome: "failed",
+                        retried: attemptState.retried
+                    )
+                    self.activePerformanceTrace = nil
                 }
             }
         }
     }
 
+    private func requestOptimization(
+        text: String,
+        apiKey: String,
+        model: String,
+        prompt: String,
+        retryIssues: [String],
+        stage: RewritePerformanceTrace.Stage
+    ) async throws -> String {
+        let startedAt = RewritePerformanceTrace.timestamp()
+        do {
+            let result = try await client.optimize(
+                text: text,
+                apiKey: apiKey,
+                model: model,
+                prompt: prompt,
+                retryIssues: retryIssues
+            )
+            activePerformanceTrace?.record(stage, since: startedAt)
+            return result
+        } catch {
+            activePerformanceTrace?.record(stage, since: startedAt)
+            throw error
+        }
+    }
+
     private func resetAfterCancelledConversationSelection() {
+        activePerformanceTrace?.finish(outcome: "cancelled", retried: false)
+        activePerformanceTrace = nil
         model.isProcessing = false
         model.statusText = model.isEnabled ? readyStatusText : "已暂停"
     }
 
     private func cancelForChangedConversation() {
+        activePerformanceTrace?.finish(outcome: "conversation_changed", retried: false)
+        activePerformanceTrace = nil
         model.isProcessing = false
         model.statusText = ConversationContextError.changed.localizedDescription
     }
 
     private func cancelForChangedText() {
+        activePerformanceTrace?.finish(outcome: "text_changed", retried: false)
+        activePerformanceTrace = nil
         model.isProcessing = false
         model.statusText = TextEditingError.textChangedWhileWaiting.localizedDescription
     }
@@ -691,6 +787,12 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                 with: completion.outcome,
                 operation: completion.action == .translate ? .translation : .optimization
             )
+            let outcome = completion.outcome == .unchanged ? "unchanged" : "changed"
+            self.activePerformanceTrace?.finish(
+                outcome: outcome,
+                retried: completion.retried
+            )
+            self.activePerformanceTrace = nil
             self.model.isProcessing = false
             self.model.statusText = self.model.isEnabled ? self.readyStatusText : "已暂停"
         }
