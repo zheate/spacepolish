@@ -80,20 +80,24 @@ final class InputProgressIndicator {
         panel.alphaValue = 0
     }
 
+    @discardableResult
     func show(
         at accessibilityScreenRect: CGRect?,
         operation: InputProgressOperation = .optimization
-    ) {
+    ) -> Bool {
         presentationGeneration &+= 1
         movementGeneration &+= 1
         dismissalWorkItem?.cancel()
         dismissalWorkItem = nil
 
         reducesMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        let initialOrigin = panelOrigin(
+        guard let initialOrigin = panelOrigin(
             for: accessibilityScreenRect,
             indicatorSize: Self.indicatorSize
-        ) ?? fallbackOrigin(indicatorSize: Self.indicatorSize)
+        ) else {
+            hide()
+            return false
+        }
         panel.setFrameOrigin(
             clampedOrigin(initialOrigin, indicatorSize: Self.indicatorSize)
         )
@@ -102,12 +106,13 @@ final class InputProgressIndicator {
         panel.alphaValue = reducesMotion ? 1 : 0
         panel.orderFrontRegardless()
 
-        guard !reducesMotion else { return }
+        guard !reducesMotion else { return true }
         animatePanelAlpha(
             to: 1,
             duration: IndicatorTiming.entrance,
             timingFunction: .easeOut
         )
+        return true
     }
 
     func move(
@@ -271,14 +276,6 @@ final class InputProgressIndicator {
         }
     }
 
-    private func fallbackOrigin(indicatorSize: NSSize) -> NSPoint {
-        let mouse = NSEvent.mouseLocation
-        return NSPoint(
-            x: mouse.x + 8,
-            y: mouse.y - indicatorSize.height / 2
-        )
-    }
-
     private func panelOrigin(
         for accessibilityScreenRect: CGRect?,
         indicatorSize: NSSize
@@ -367,8 +364,8 @@ private enum IndicatorVisualState {
 
 private final class ProgressIndicatorView: NSView {
     private enum Timing {
-        static let optimizationLoop: CFTimeInterval = 1.16
-        static let translationLoop: CFTimeInterval = 1.24
+        static let optimizationLoop: CFTimeInterval = 1.12
+        static let translationLoop: CFTimeInterval = 1.04
         static let convergence: CFTimeInterval = 0.20
     }
 
@@ -379,10 +376,9 @@ private final class ProgressIndicatorView: NSView {
         let backgroundColor: CGColor?
     }
 
-    private let dots: [CALayer] = (0..<3).map { _ in CALayer() }
-    private let sparkLayer = CALayer()
+    private let processingBarLayer = CALayer()
+    private let shimmerLayer = CAGradientLayer()
     private let iconView = NSImageView()
-    private var restingPositions: [CGPoint] = []
     private var reducesMotion = false
 
     override init(frame frameRect: NSRect) {
@@ -394,29 +390,18 @@ private final class ProgressIndicatorView: NSView {
         layer?.borderWidth = 0.5
         layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
 
-        sparkLayer.frame = CGRect(x: 11, y: 5, width: 8, height: 8)
-        sparkLayer.cornerRadius = 4
-        sparkLayer.opacity = 0
-        layer?.addSublayer(sparkLayer)
+        processingBarLayer.frame = CGRect(x: 9, y: 7, width: 12, height: 4)
+        processingBarLayer.cornerRadius = 2
+        processingBarLayer.masksToBounds = true
+        processingBarLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        layer?.addSublayer(processingBarLayer)
 
-        let diameter: CGFloat = 4
-        let gap: CGFloat = 4
-        let totalWidth = diameter * 3 + gap * 2
-        let startX = (frameRect.width - totalWidth) / 2
-        let y = (frameRect.height - diameter) / 2
-
-        for (index, dot) in dots.enumerated() {
-            dot.frame = CGRect(
-                x: startX + CGFloat(index) * (diameter + gap),
-                y: y,
-                width: diameter,
-                height: diameter
-            )
-            dot.cornerRadius = diameter / 2
-            dot.backgroundColor = NSColor.white.cgColor
-            restingPositions.append(dot.position)
-            layer?.addSublayer(dot)
-        }
+        shimmerLayer.frame = CGRect(x: -8, y: 0, width: 8, height: 4)
+        shimmerLayer.startPoint = CGPoint(x: 0, y: 0.5)
+        shimmerLayer.endPoint = CGPoint(x: 1, y: 0.5)
+        shimmerLayer.locations = [0, 0.5, 1]
+        shimmerLayer.cornerRadius = 2
+        processingBarLayer.addSublayer(shimmerLayer)
 
         iconView.frame = NSRect(x: 9, y: 3, width: 12, height: 12)
         iconView.imageScaling = .scaleProportionallyUpOrDown
@@ -441,21 +426,15 @@ private final class ProgressIndicatorView: NSView {
         iconView.alphaValue = 0
         iconView.layer?.transform = CATransform3DIdentity
 
-        let colors = processingColors(for: operation)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        for (index, dot) in dots.enumerated() {
-            dot.position = restingPositions[index]
-            dot.opacity = reducesMotion ? 0.78 : 0.48
-            dot.transform = CATransform3DIdentity
-            dot.backgroundColor = colors[index]
-        }
-        sparkLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
-        sparkLayer.opacity = 0
-        sparkLayer.transform = CATransform3DIdentity
-        sparkLayer.backgroundColor = operation == .translation
-            ? NSColor.systemCyan.withAlphaComponent(0.34).cgColor
-            : NSColor.systemPurple.withAlphaComponent(0.34).cgColor
+        processingBarLayer.opacity = reducesMotion ? 0.82 : 0.70
+        processingBarLayer.transform = CATransform3DIdentity
+        processingBarLayer.backgroundColor = processingTrackColor(for: operation)
+        shimmerLayer.opacity = reducesMotion ? 0.54 : 0
+        shimmerLayer.transform = CATransform3DIdentity
+        shimmerLayer.position = CGPoint(x: reducesMotion ? 6 : -4, y: 2)
+        shimmerLayer.colors = processingShimmerColors(for: operation)
         CATransaction.commit()
 
         guard !reducesMotion else { return }
@@ -468,19 +447,28 @@ private final class ProgressIndicatorView: NSView {
         }
     }
 
-    private func processingColors(for operation: InputProgressOperation) -> [CGColor] {
+    private func processingTrackColor(for operation: InputProgressOperation) -> CGColor {
+        switch operation {
+        case .optimization:
+            return NSColor.systemPurple.withAlphaComponent(0.34).cgColor
+        case .translation:
+            return NSColor.systemCyan.withAlphaComponent(0.34).cgColor
+        }
+    }
+
+    private func processingShimmerColors(for operation: InputProgressOperation) -> [CGColor] {
         switch operation {
         case .optimization:
             return [
-                NSColor(calibratedWhite: 0.78, alpha: 1).cgColor,
-                NSColor.white.cgColor,
-                NSColor(calibratedWhite: 0.78, alpha: 1).cgColor
+                NSColor.white.withAlphaComponent(0).cgColor,
+                NSColor.white.withAlphaComponent(0.96).cgColor,
+                NSColor.systemPurple.withAlphaComponent(0).cgColor
             ]
         case .translation:
             return [
-                NSColor.systemCyan.cgColor,
-                NSColor.white.cgColor,
-                NSColor.systemBlue.cgColor
+                NSColor.systemCyan.withAlphaComponent(0).cgColor,
+                NSColor.white.withAlphaComponent(0.96).cgColor,
+                NSColor.systemBlue.withAlphaComponent(0).cgColor
             ]
         }
     }
@@ -496,143 +484,58 @@ private final class ProgressIndicatorView: NSView {
     }
 
     private func showOptimizationProcessing() {
-        let keyTimes: [NSNumber] = [0, 0.28, 0.50, 0.72, 1]
-        let startTime = CACurrentMediaTime()
-        let center = CGPoint(x: bounds.midX, y: bounds.midY)
-
-        for (index, dot) in dots.enumerated() {
-            let base = restingPositions[index]
-            let softApproach = CGPoint(
-                x: base.x + (center.x - base.x) * 0.14,
-                y: center.y
-            )
-            let closeApproach = CGPoint(
-                x: base.x + (center.x - base.x) * 0.28,
-                y: center.y
-            )
-            let position = makeKeyframe(
-                keyPath: "position",
-                values: [
-                    NSValue(point: base),
-                    NSValue(point: softApproach),
-                    NSValue(point: closeApproach),
-                    NSValue(point: softApproach),
-                    NSValue(point: base)
-                ],
-                keyTimes: keyTimes
-            )
-            let opacityValues: [Any] = index == 1
-                ? [0.58, 0.72, 0.96, 0.72, 0.58]
-                : [0.42, 0.58, 0.80, 0.58, 0.42]
-            let opacity = makeKeyframe(
-                keyPath: "opacity",
-                values: opacityValues,
-                keyTimes: keyTimes
-            )
-            let scaleValues: [Any] = index == 1
-                ? [0.96, 1.0, 1.14, 1.0, 0.96]
-                : [1.0, 1.0, 1.0, 1.0, 1.0]
-            let scale = makeKeyframe(
-                keyPath: "transform.scale",
-                values: scaleValues,
-                keyTimes: keyTimes
-            )
-            addLoop(
-                [position, opacity, scale],
-                to: dot,
-                duration: Timing.optimizationLoop,
-                startTime: startTime
-            )
-        }
-
-        let glowOpacity = makeKeyframe(
-            keyPath: "opacity",
-            values: [0, 0.03, 0.18, 0.03, 0],
-            keyTimes: keyTimes
-        )
-        let glowScale = makeKeyframe(
-            keyPath: "transform.scale",
-            values: [0.68, 0.82, 1.28, 0.82, 0.68],
-            keyTimes: keyTimes
-        )
-        addLoop(
-            [glowOpacity, glowScale],
-            to: sparkLayer,
+        showShimmerProcessing(
             duration: Timing.optimizationLoop,
-            startTime: startTime
+            trackOpacity: [0.62, 0.78, 0.68, 0.62],
+            trackScale: [0.98, 1.02, 1.0, 0.98]
         )
     }
 
     private func showTranslationProcessing() {
-        let keyTimes: [NSNumber] = [0, 0.24, 0.50, 0.76, 1]
-        let startTime = CACurrentMediaTime()
-        let left = restingPositions[0]
-        let center = restingPositions[1]
-        let right = restingPositions[2]
-        let arcHeight: CGFloat = 0.9
-
-        let paths: [[CGPoint]] = [
-            [
-                left,
-                CGPoint(x: center.x, y: center.y + arcHeight),
-                right,
-                CGPoint(x: center.x, y: center.y - arcHeight),
-                left
-            ],
-            [center, center, center, center, center],
-            [
-                right,
-                CGPoint(x: center.x, y: center.y - arcHeight),
-                left,
-                CGPoint(x: center.x, y: center.y + arcHeight),
-                right
-            ]
-        ]
-
-        for (index, dot) in dots.enumerated() {
-            let position = makeKeyframe(
-                keyPath: "position",
-                values: paths[index].map { NSValue(point: $0) },
-                keyTimes: keyTimes
-            )
-            let opacityValues: [Any] = index == 1
-                ? [0.62, 0.70, 0.82, 0.70, 0.62]
-                : [0.68, 0.90, 0.82, 0.90, 0.68]
-            let opacity = makeKeyframe(
-                keyPath: "opacity",
-                values: opacityValues,
-                keyTimes: keyTimes
-            )
-            let scaleValues: [Any] = index == 1
-                ? [0.94, 0.98, 1.06, 0.98, 0.94]
-                : [0.94, 1.02, 0.98, 1.02, 0.94]
-            let scale = makeKeyframe(
-                keyPath: "transform.scale",
-                values: scaleValues,
-                keyTimes: keyTimes
-            )
-            addLoop(
-                [position, opacity, scale],
-                to: dot,
-                duration: Timing.translationLoop,
-                startTime: startTime
-            )
-        }
-
-        let glowOpacity = makeKeyframe(
-            keyPath: "opacity",
-            values: [0.02, 0.12, 0.04, 0.12, 0.02],
-            keyTimes: keyTimes
+        showShimmerProcessing(
+            duration: Timing.translationLoop,
+            trackOpacity: [0.66, 0.82, 0.72, 0.66],
+            trackScale: [0.99, 1.01, 1.0, 0.99]
         )
-        let glowScale = makeKeyframe(
-            keyPath: "transform.scale",
-            values: [0.72, 1.02, 0.82, 1.02, 0.72],
-            keyTimes: keyTimes
+    }
+
+    private func showShimmerProcessing(
+        duration: CFTimeInterval,
+        trackOpacity: [Any],
+        trackScale: [Any]
+    ) {
+        let startTime = CACurrentMediaTime()
+        let shimmerPosition = makeKeyframe(
+            keyPath: "position.x",
+            values: [-4, 0, 12, 16],
+            keyTimes: [0, 0.16, 0.78, 1]
+        )
+        let shimmerOpacity = makeKeyframe(
+            keyPath: "opacity",
+            values: [0, 0.92, 0.92, 0],
+            keyTimes: [0, 0.16, 0.78, 1]
         )
         addLoop(
-            [glowOpacity, glowScale],
-            to: sparkLayer,
-            duration: Timing.translationLoop,
+            [shimmerPosition, shimmerOpacity],
+            to: shimmerLayer,
+            duration: duration,
+            startTime: startTime
+        )
+
+        let barOpacity = makeKeyframe(
+            keyPath: "opacity",
+            values: trackOpacity,
+            keyTimes: [0, 0.30, 0.72, 1]
+        )
+        let barScale = makeKeyframe(
+            keyPath: "transform.scale",
+            values: trackScale,
+            keyTimes: [0, 0.30, 0.72, 1]
+        )
+        addLoop(
+            [barOpacity, barScale],
+            to: processingBarLayer,
+            duration: duration,
             startTime: startTime
         )
     }
@@ -677,9 +580,8 @@ private final class ProgressIndicatorView: NSView {
         _ state: IndicatorVisualState,
         accessibilityDescription: String
     ) {
-        let dotSnapshots = dots.map(snapshot)
-        let sparkSnapshot = snapshot(sparkLayer)
-        freezeProcessingLayers(dotSnapshots: dotSnapshots, sparkSnapshot: sparkSnapshot)
+        let barSnapshot = snapshot(processingBarLayer)
+        freezeProcessingLayers(barSnapshot: barSnapshot)
 
         let configuration = NSImage.SymbolConfiguration(pointSize: 9, weight: .semibold)
         iconView.image = NSImage(
@@ -691,12 +593,11 @@ private final class ProgressIndicatorView: NSView {
         setAccessibilityLabel(accessibilityDescription)
 
         if reducesMotion {
-            showReducedMotionResult(dotSnapshots: dotSnapshots)
+            showReducedMotionResult(barSnapshot: barSnapshot)
         } else {
             showConvergingResult(
                 state,
-                dotSnapshots: dotSnapshots,
-                sparkSnapshot: sparkSnapshot
+                barSnapshot: barSnapshot
             )
         }
     }
@@ -711,128 +612,85 @@ private final class ProgressIndicatorView: NSView {
         )
     }
 
-    private func freezeProcessingLayers(
-        dotSnapshots: [LayerSnapshot],
-        sparkSnapshot: LayerSnapshot
-    ) {
+    private func freezeProcessingLayers(barSnapshot: LayerSnapshot) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        for (dot, snapshot) in zip(dots, dotSnapshots) {
-            dot.removeAllAnimations()
-            dot.position = snapshot.position
-            dot.opacity = snapshot.opacity
-            dot.transform = CATransform3DMakeScale(snapshot.scale, snapshot.scale, 1)
-            dot.backgroundColor = snapshot.backgroundColor
-        }
-        sparkLayer.removeAllAnimations()
-        sparkLayer.position = sparkSnapshot.position
-        sparkLayer.opacity = sparkSnapshot.opacity
-        sparkLayer.transform = CATransform3DMakeScale(
-            sparkSnapshot.scale,
-            sparkSnapshot.scale,
+        processingBarLayer.removeAllAnimations()
+        processingBarLayer.position = barSnapshot.position
+        processingBarLayer.opacity = barSnapshot.opacity
+        processingBarLayer.transform = CATransform3DMakeScale(
+            barSnapshot.scale,
+            barSnapshot.scale,
             1
         )
-        sparkLayer.backgroundColor = sparkSnapshot.backgroundColor
+        processingBarLayer.backgroundColor = barSnapshot.backgroundColor
+        shimmerLayer.removeAllAnimations()
+        shimmerLayer.opacity = 0
         layer?.removeAnimation(forKey: "appearance")
         iconView.layer?.removeAllAnimations()
         iconView.alphaValue = 0
         CATransaction.commit()
     }
 
-    private func showReducedMotionResult(dotSnapshots: [LayerSnapshot]) {
+    private func showReducedMotionResult(barSnapshot: LayerSnapshot) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        dots.forEach { $0.opacity = 0 }
-        sparkLayer.opacity = 0
+        processingBarLayer.opacity = 0
         iconView.alphaValue = 1
         CATransaction.commit()
 
-        for (dot, snapshot) in zip(dots, dotSnapshots) {
-            let fade = CABasicAnimation(keyPath: "opacity")
-            fade.fromValue = snapshot.opacity
-            fade.toValue = 0
-            fade.duration = 0.12
-            fade.timingFunction = CAMediaTimingFunction(name: .easeIn)
-            dot.add(fade, forKey: "resultFade")
-        }
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = barSnapshot.opacity
+        fade.toValue = 0
+        fade.duration = 0.12
+        fade.timingFunction = CAMediaTimingFunction(name: .easeIn)
+        processingBarLayer.add(fade, forKey: "resultFade")
 
         guard let iconLayer = iconView.layer else { return }
-        let fade = CAKeyframeAnimation(keyPath: "opacity")
-        fade.values = [0, 0, 1]
-        fade.keyTimes = [0, 0.42, 1]
-        fade.duration = IndicatorTiming.resultTransition
-        fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        iconLayer.add(fade, forKey: "resultTransition")
+        let iconFade = CAKeyframeAnimation(keyPath: "opacity")
+        iconFade.values = [0, 0, 1]
+        iconFade.keyTimes = [0, 0.42, 1]
+        iconFade.duration = IndicatorTiming.resultTransition
+        iconFade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        iconLayer.add(iconFade, forKey: "resultTransition")
     }
 
     private func showConvergingResult(
         _ state: IndicatorVisualState,
-        dotSnapshots: [LayerSnapshot],
-        sparkSnapshot: LayerSnapshot
+        barSnapshot: LayerSnapshot
     ) {
-        let center = CGPoint(x: bounds.midX, y: bounds.midY)
-        let finalScale: CGFloat = 0.38
         let resultColor = state.color.cgColor
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        for dot in dots {
-            dot.position = center
-            dot.opacity = 0
-            dot.transform = CATransform3DMakeScale(finalScale, finalScale, 1)
-            dot.backgroundColor = resultColor
-        }
-        sparkLayer.position = center
-        sparkLayer.opacity = 0
-        sparkLayer.transform = CATransform3DMakeScale(0.62, 0.62, 1)
-        sparkLayer.backgroundColor = resultColor
+        processingBarLayer.opacity = 0
+        processingBarLayer.transform = CATransform3DMakeScale(0.16, 0.72, 1)
+        processingBarLayer.backgroundColor = resultColor
         iconView.alphaValue = 1
         iconView.layer?.transform = CATransform3DIdentity
         CATransaction.commit()
 
-        for (dot, snapshot) in zip(dots, dotSnapshots) {
-            let position = CABasicAnimation(keyPath: "position")
-            position.fromValue = NSValue(point: snapshot.position)
-            position.toValue = NSValue(point: center)
+        let barOpacity = CABasicAnimation(keyPath: "opacity")
+        barOpacity.fromValue = barSnapshot.opacity
+        barOpacity.toValue = 0
 
-            let opacity = CABasicAnimation(keyPath: "opacity")
-            opacity.fromValue = snapshot.opacity
-            opacity.toValue = 0
+        let barScaleX = CABasicAnimation(keyPath: "transform.scale.x")
+        barScaleX.fromValue = barSnapshot.scale
+        barScaleX.toValue = 0.16
 
-            let scale = CABasicAnimation(keyPath: "transform.scale")
-            scale.fromValue = snapshot.scale
-            scale.toValue = finalScale
+        let barScaleY = CABasicAnimation(keyPath: "transform.scale.y")
+        barScaleY.fromValue = barSnapshot.scale
+        barScaleY.toValue = 0.72
 
-            let color = CABasicAnimation(keyPath: "backgroundColor")
-            color.fromValue = snapshot.backgroundColor
-            color.toValue = resultColor
+        let barColor = CABasicAnimation(keyPath: "backgroundColor")
+        barColor.fromValue = barSnapshot.backgroundColor
+        barColor.toValue = resultColor
 
-            let convergence = CAAnimationGroup()
-            convergence.animations = [position, opacity, scale, color]
-            convergence.duration = Timing.convergence
-            convergence.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            dot.add(convergence, forKey: "resultConvergence")
-        }
-
-        let sparkOpacity = makeKeyframe(
-            keyPath: "opacity",
-            values: [sparkSnapshot.opacity, 0.22, 0],
-            keyTimes: [0, 0.42, 1]
-        )
-        let sparkScale = makeKeyframe(
-            keyPath: "transform.scale",
-            values: [sparkSnapshot.scale, 1.10, 0.62],
-            keyTimes: [0, 0.42, 1]
-        )
-        let sparkColor = CABasicAnimation(keyPath: "backgroundColor")
-        sparkColor.fromValue = sparkSnapshot.backgroundColor
-        sparkColor.toValue = resultColor
-
-        let sparkTransition = CAAnimationGroup()
-        sparkTransition.animations = [sparkOpacity, sparkScale, sparkColor]
-        sparkTransition.duration = Timing.convergence
-        sparkTransition.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        sparkLayer.add(sparkTransition, forKey: "resultBridge")
+        let convergence = CAAnimationGroup()
+        convergence.animations = [barOpacity, barScaleX, barScaleY, barColor]
+        convergence.duration = Timing.convergence
+        convergence.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        processingBarLayer.add(convergence, forKey: "resultConvergence")
 
         guard let iconLayer = iconView.layer else { return }
         let fade = CAKeyframeAnimation(keyPath: "opacity")
@@ -851,8 +709,8 @@ private final class ProgressIndicatorView: NSView {
     }
 
     func stopAnimating() {
-        dots.forEach { $0.removeAllAnimations() }
-        sparkLayer.removeAllAnimations()
+        processingBarLayer.removeAllAnimations()
+        shimmerLayer.removeAllAnimations()
         iconView.layer?.removeAllAnimations()
         layer?.removeAllAnimations()
     }

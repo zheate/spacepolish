@@ -247,18 +247,34 @@ private enum AccessibilityCaretLocator {
         preferredLocation: Int? = nil,
         fallbackLocation: Int? = nil
     ) -> CGRect? {
-        let location: Int
-        if let preferredLocation {
-            location = preferredLocation
-        } else if let selectedRange = selectedTextRange(on: element) {
-            location = selectedRange.location + selectedRange.length
-        } else if let fallbackLocation {
-            location = fallbackLocation
-        } else {
-            return nil
+        let selectedLocation = selectedTextRange(on: element).map {
+            $0.location + $0.length
+        }
+        let locations = [preferredLocation, selectedLocation, fallbackLocation]
+            .compactMap { $0 }
+            .filter { $0 >= 0 }
+            .reduce(into: [Int]()) { result, location in
+                guard !result.contains(location) else { return }
+                result.append(location)
+            }
+
+        for location in locations {
+            if let rect = screenRect(at: location, on: element) {
+                return rect
+            }
         }
 
-        guard location >= 0 else { return nil }
+        // Chromium/WebKit editors often expose text-marker geometry even when
+        // AXBoundsForRange is unavailable. Walk a few ancestors because the
+        // marker API may live on the surrounding web area instead of the
+        // focused editable node.
+        return textMarkerScreenRect(on: element)
+    }
+
+    private static func screenRect(
+        at location: Int,
+        on element: AXUIElement
+    ) -> CGRect? {
 
         if let caretRect = bounds(
             for: CFRange(location: location, length: 0),
@@ -343,6 +359,67 @@ private enum AccessibilityCaretLocator {
             return nil
         }
         return range
+    }
+
+    private static func textMarkerScreenRect(on element: AXUIElement) -> CGRect? {
+        var candidate: AXUIElement? = element
+        for _ in 0..<4 {
+            guard let current = candidate else { break }
+            if let rect = selectedTextMarkerScreenRect(on: current) {
+                return insertionRect(at: rect.maxX, matching: rect)
+            }
+            candidate = parent(of: current)
+        }
+        return nil
+    }
+
+    private static func selectedTextMarkerScreenRect(
+        on element: AXUIElement
+    ) -> CGRect? {
+        var markerRangeRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element,
+            "AXSelectedTextMarkerRange" as CFString,
+            &markerRangeRef
+        ) == .success,
+              let markerRangeRef else {
+            return nil
+        }
+
+        var boundsRef: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(
+            element,
+            "AXBoundsForTextMarkerRange" as CFString,
+            markerRangeRef,
+            &boundsRef
+        ) == .success,
+              let boundsRef,
+              CFGetTypeID(boundsRef) == AXValueGetTypeID() else {
+            return nil
+        }
+
+        let boundsValue = boundsRef as! AXValue
+        var rect = CGRect.zero
+        guard AXValueGetType(boundsValue) == .cgRect,
+              AXValueGetValue(boundsValue, .cgRect, &rect),
+              rect.height > 0 else {
+            return nil
+        }
+        return rect
+    }
+
+    private static func parent(of element: AXUIElement) -> AXUIElement? {
+        var parentRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element,
+            kAXParentAttribute as CFString,
+            &parentRef
+        ) == .success,
+              let parentRef,
+              CFGetTypeID(parentRef) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        return (parentRef as! AXUIElement)
     }
 
     private static func bounds(

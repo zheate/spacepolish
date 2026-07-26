@@ -54,6 +54,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     private var settingsController: SettingsWindowController?
     private var isMonitorStarted = false
     private var pendingCompletion: PendingCompletion?
+    private var progressPositionRetryWorkItem: DispatchWorkItem?
     private var recentRewriteFeedbackContext: RecentRewriteFeedbackContext?
     private var activePerformanceTrace: RewritePerformanceTrace?
 
@@ -330,10 +331,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         }
         model.isProcessing = true
         model.statusText = "正在理解当前会话…"
-        inputProgressIndicator.show(
-            at: textService.insertionPointScreenRect(for: context),
-            operation: .optimization
-        )
+        showInputProgress(for: context, operation: .optimization)
         let provider = ExternalHelperProvider(executableURL: helperURL)
         let historyStartedAt = RewritePerformanceTrace.timestamp()
         Task { [weak self] in
@@ -567,9 +565,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         model.isProcessing = true
         model.statusText = action.promptDescription
         if !progressAlreadyShown {
-            let insertionPoint = textService.insertionPointScreenRect(for: context)
-            inputProgressIndicator.show(
-                at: insertionPoint,
+            showInputProgress(
+                for: context,
                 operation: action == .translate ? .translation : .optimization
             )
         }
@@ -752,7 +749,48 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         }
     }
 
+    private func showInputProgress(
+        for context: CapturedTextContext,
+        operation: InputProgressOperation
+    ) {
+        progressPositionRetryWorkItem?.cancel()
+        progressPositionRetryWorkItem = nil
+        attemptToShowInputProgress(
+            for: context,
+            operation: operation,
+            remainingDelays: [0.04, 0.12, 0.24]
+        )
+    }
+
+    private func attemptToShowInputProgress(
+        for context: CapturedTextContext,
+        operation: InputProgressOperation,
+        remainingDelays: [TimeInterval]
+    ) {
+        guard model.isProcessing else { return }
+        if inputProgressIndicator.show(
+            at: textService.insertionPointScreenRect(for: context),
+            operation: operation
+        ) {
+            progressPositionRetryWorkItem = nil
+            return
+        }
+
+        guard let delay = remainingDelays.first else { return }
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.attemptToShowInputProgress(
+                for: context,
+                operation: operation,
+                remainingDelays: Array(remainingDelays.dropFirst())
+            )
+        }
+        progressPositionRetryWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
     private func resetAfterCancelledConversationSelection() {
+        progressPositionRetryWorkItem?.cancel()
+        progressPositionRetryWorkItem = nil
         activePerformanceTrace?.finish(outcome: "cancelled", retried: false)
         activePerformanceTrace = nil
         model.isProcessing = false
@@ -760,6 +798,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     }
 
     private func cancelForChangedConversation() {
+        progressPositionRetryWorkItem?.cancel()
+        progressPositionRetryWorkItem = nil
         activePerformanceTrace?.finish(outcome: "conversation_changed", retried: false)
         activePerformanceTrace = nil
         model.isProcessing = false
@@ -767,6 +807,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     }
 
     private func cancelForChangedText() {
+        progressPositionRetryWorkItem?.cancel()
+        progressPositionRetryWorkItem = nil
         activePerformanceTrace?.finish(outcome: "text_changed", retried: false)
         activePerformanceTrace = nil
         model.isProcessing = false
@@ -776,6 +818,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     @objc private func finishPendingCompletion() {
         guard let completion = pendingCompletion, model.isProcessing else { return }
         pendingCompletion = nil
+        progressPositionRetryWorkItem?.cancel()
+        progressPositionRetryWorkItem = nil
         inputProgressIndicator.move(
             to: textService.insertionPointScreenRect(
                 for: completion.context,
