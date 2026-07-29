@@ -441,6 +441,7 @@ private enum IndicatorVisualState {
 private final class ProgressIndicatorView: NSView {
     private static let surfaceColor = NSColor(calibratedWhite: 0.055, alpha: 0.94)
     private static let surfaceBorderColor = NSColor.white.withAlphaComponent(0.14)
+    private static let processingColor = NSColor.systemBlue
 
     private enum Timing {
         static let loadingLoop: CFTimeInterval = 1.0
@@ -487,12 +488,7 @@ private final class ProgressIndicatorView: NSView {
         processingBarLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
         layer?.addSublayer(processingBarLayer)
 
-        let dotColor = NSColor(
-            calibratedRed: 0.4,
-            green: 0.1765,
-            blue: 0.5686,
-            alpha: 1
-        ).cgColor
+        let dotColor = Self.processingColor.cgColor
         let sourceXPositions: [CGFloat] = [301.814, 401.814, 501.814]
         let contentScale: CGFloat = 0.06
         for (index, dotLayer) in loadingDotLayers.enumerated() {
