@@ -16,9 +16,10 @@ final class SettingsWindowController: NSWindowController {
     private let helperPathLabel = NSTextField(wrappingLabelWithString: "未配置本地 helper")
     private let helperStatusLabel = NSTextField(labelWithString: "")
     private let historyCheckbox = NSButton(checkboxWithTitle: "允许分析当前会话历史", target: nil, action: nil)
-    private let learningCheckbox = NSButton(checkboxWithTitle: "允许从本人已发送成稿学习", target: nil, action: nil)
+    private let learningCheckbox = NSButton(checkboxWithTitle: "本地记录优化历史并学习我的表达", target: nil, action: nil)
     private let voiceSummaryLabel = NSTextField(wrappingLabelWithString: "尚未建立用户声音画像")
     private let conversationProfilesView: ConversationProfilesSettingsView
+    private let rewriteHistoryView: RewriteHistorySettingsView
 
     init(
         model: AppModel,
@@ -31,6 +32,7 @@ final class SettingsWindowController: NSWindowController {
         self.onRequestPermission = onRequestPermission
         self.onRequestScreenCapturePermission = onRequestScreenCapturePermission
         self.conversationProfilesView = ConversationProfilesSettingsView(store: model.intelligence)
+        self.rewriteHistoryView = RewriteHistorySettingsView(store: model.intelligence)
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 700, height: 660),
@@ -72,6 +74,7 @@ final class SettingsWindowController: NSWindowController {
         tabs.tabViewType = .topTabsBezelBorder
         tabs.addTabViewItem(tabItem(label: "通用", view: buildGeneralTab()))
         tabs.addTabViewItem(tabItem(label: "沟通智能", view: buildIntelligenceTab()))
+        tabs.addTabViewItem(tabItem(label: "优化历史", view: rewriteHistoryView))
         tabs.addTabViewItem(tabItem(label: "聊天对象", view: buildRelationshipsTab()))
         tabs.addTabViewItem(tabItem(label: "隐私", view: buildPrivacyTab()))
 
@@ -179,7 +182,7 @@ final class SettingsWindowController: NSWindowController {
 
         historyCheckbox.target = self
         learningCheckbox.target = self
-        let consentHint = secondaryLabel("两个开关默认关闭。原始历史只在内存中分析，不发送到云端。")
+        let consentHint = secondaryLabel("聊天 helper 原文只在内存中分析；优化历史会加密保存在本机，云端只接收当前待处理文本和不含正文的风格摘要。")
         let consentBox = makeBox(
             title: "本地学习授权",
             content: verticalStack([historyCheckbox, learningCheckbox, consentHint], spacing: 10),
@@ -221,7 +224,7 @@ final class SettingsWindowController: NSWindowController {
         )
 
         let boundary = secondaryLabel(
-            "聊天标题、会话 ID、helper 数据、关系证据和声音画像不会发送给通义千问。云端只接收当前待润色文本以及不含姓名的表达策略。加密画像保存在 Application Support，密钥保存在系统钥匙串。"
+            "聊天标题、会话 ID、helper 数据、优化历史正文和关系证据不会发送给通义千问。云端只接收当前待润色文本，以及由本地画像生成的不含姓名和历史正文的表达策略。加密数据保存在 Application Support，密钥保存在系统钥匙串。"
         )
         let exportButton = NSButton(title: "导出派生画像…", target: self, action: #selector(exportProfiles))
         let clearButton = NSButton(title: "清除全部智能数据…", target: self, action: #selector(clearIntelligenceData))
@@ -363,7 +366,7 @@ final class SettingsWindowController: NSWindowController {
             return
         }
         voiceSummaryLabel.stringValue = String(
-            format: "已从 %d 条本人消息学习 · 直接度 %.0f%% · 正式度 %.0f%% · 平均句长 %.0f 字",
+            format: "已从 %d 条本地样本学习 · 直接度 %.0f%% · 正式度 %.0f%% · 平均句长 %.0f 字",
             voice.sampleCount,
             voice.metrics.directness * 100,
             voice.metrics.formality * 100,
@@ -467,7 +470,7 @@ final class SettingsWindowController: NSWindowController {
     @objc private func clearIntelligenceData() {
         let alert = NSAlert()
         alert.messageText = "清除全部智能数据？"
-        alert.informativeText = "将删除关系画像、声音画像和待学习样本；API Key 与基础设置不受影响。"
+        alert.informativeText = "将删除关系画像、声音画像、优化历史和待学习样本；API Key 与基础设置不受影响。"
         alert.addButton(withTitle: "清除")
         alert.addButton(withTitle: "取消")
         guard alert.runModal() == .alertFirstButtonReturn else { return }

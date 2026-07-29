@@ -22,6 +22,15 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                 return "translate"
             }
         }
+
+        var progressOperation: InputProgressOperation {
+            switch self {
+            case .polish:
+                return .optimization
+            case .translate:
+                return .translation
+            }
+        }
     }
 
     private struct PendingCompletion {
@@ -34,6 +43,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
 
     private struct RecentRewriteFeedbackContext {
         let relationshipID: UUID?
+        let historyEntryID: UUID?
         let createdAt: Date
     }
 
@@ -61,10 +71,14 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     override init() {
         super.init()
 
-        statusItem.button?.image = NSImage(
-            systemSymbolName: "wand.and.stars",
+        let statusIcon = NSImage(
+            systemSymbolName: "sparkle",
             accessibilityDescription: "Pole"
+        )?.withSymbolConfiguration(
+            NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
         )
+        statusIcon?.isTemplate = true
+        statusItem.button?.image = statusIcon
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
@@ -172,7 +186,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
               let context = recentRewriteFeedbackContext else { return }
         model.intelligence.applyFeedback(
             RewriteFeedback.allCases[sender.tag],
-            relationshipID: context.relationshipID
+            relationshipID: context.relationshipID,
+            historyEntryID: context.historyEntryID
         )
         model.statusText = "反馈已在本机学习"
     }
@@ -245,11 +260,14 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     }
 
     private func handleTrigger(_ action: RewriteAction) {
+        guard !model.isProcessing else { return }
+        inputProgressIndicator.showFallback(operation: action.progressOperation)
+
         guard model.hasAPIKey else {
-            model.statusText = model.isEnabled ? readyStatusText : "已暂停"
+            inputProgressIndicator.fail()
+            model.statusText = "请先设置通义千问 API Key"
             return
         }
-        guard !model.isProcessing else { return }
 
         let trace = RewritePerformanceTrace(action: action.performanceName)
         activePerformanceTrace = trace
@@ -261,7 +279,9 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             trace.record(.capture, since: captureStartedAt)
             trace.finish(outcome: "capture_failed", retried: false)
             activePerformanceTrace = nil
-            model.statusText = model.isEnabled ? readyStatusText : "已暂停"
+            inputProgressIndicator.fail()
+            model.statusText = (error as? LocalizedError)?.errorDescription
+                ?? "无法读取当前输入框"
             return
         }
         trace.setInputLength(context.sourceText.count)
@@ -424,11 +444,10 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         context: CapturedTextContext,
         snapshot: ConversationSnapshot
     ) {
-        if snapshot.canCreateProfile, let title = snapshot.title {
-            showConversationProfilePanel(for: snapshot, title: title, context: context)
-        } else {
-            beginPolish(context: context, snapshot: snapshot, relationship: nil)
-        }
+        // Ordinary chat polishing must remain one gesture. Unknown contacts use
+        // the messaging defaults immediately instead of interrupting the first
+        // rewrite with relationship setup.
+        beginPolish(context: context, snapshot: snapshot, relationship: nil)
     }
 
     private func beginPolish(
@@ -445,6 +464,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             relationshipConfidence: relationship?.confidence ?? 0,
             dimensions: relationship?.dimensions,
             voice: voiceMetrics,
+            voiceSampleCount: model.intelligence.voice.sampleCount(for: relationship?.id),
             customInstruction: relationship?.anonymizedInstruction(),
             messageExpansionRatio: model.intelligence.safety.preferredExpansionRatio
         )
@@ -672,17 +692,24 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                     try self.textService.replace(context: context, with: result)
                     if action == .polish {
                         let relationshipID = communicationContext?.relationship?.id
+                        let historyEntryID: UUID?
+                        if self.model.rewriteLearningEnabled,
+                           let communicationContext {
+                            historyEntryID = self.model.intelligence.recordRewrite(
+                                sourceText: context.sourceText,
+                                rewrittenText: result,
+                                applicationRole: communicationContext.applicationContext.role,
+                                relationshipID: relationshipID,
+                                conversationID: communicationContext.relationship?.conversationID
+                            )
+                        } else {
+                            historyEntryID = nil
+                        }
                         self.recentRewriteFeedbackContext = RecentRewriteFeedbackContext(
                             relationshipID: relationshipID,
+                            historyEntryID: historyEntryID,
                             createdAt: Date()
                         )
-                        if self.model.rewriteLearningEnabled, result != context.sourceText {
-                            self.model.intelligence.recordPendingRewrite(
-                                text: result,
-                                relationshipID: relationshipID,
-                                conversationID: communicationContext?.relationship?.conversationID
-                            )
-                        }
                     }
                     let finalCursorUTF16 = context.replacementRange.location
                         + (result as NSString).length

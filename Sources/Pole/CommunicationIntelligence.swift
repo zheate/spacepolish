@@ -218,6 +218,15 @@ struct VoiceProfile: Codable, Equatable {
         }
         return VoiceAnalyzer.blend(metrics, overlay.metrics, overlayWeight: 0.65)
     }
+
+    func sampleCount(for relationshipID: UUID?) -> Int {
+        guard let relationshipID,
+              let overlay = relationshipOverlays.first(where: { $0.relationshipID == relationshipID }),
+              overlay.sampleCount >= 3 else {
+            return sampleCount
+        }
+        return overlay.sampleCount
+    }
 }
 
 enum RewriteFeedback: String, Codable, CaseIterable {
@@ -293,6 +302,61 @@ struct PendingRewriteSample: Codable, Equatable, Identifiable {
     }
 }
 
+struct RewriteHistoryEntry: Codable, Equatable, Identifiable {
+    let id: UUID
+    let sourceText: String
+    let rewrittenText: String
+    let applicationRole: ApplicationWritingRole
+    let relationshipID: UUID?
+    let createdAt: Date
+    var feedback: RewriteFeedback?
+
+    init(
+        id: UUID = UUID(),
+        sourceText: String,
+        rewrittenText: String,
+        applicationRole: ApplicationWritingRole,
+        relationshipID: UUID?,
+        createdAt: Date = Date(),
+        feedback: RewriteFeedback? = nil
+    ) {
+        self.id = id
+        self.sourceText = sourceText
+        self.rewrittenText = rewrittenText
+        self.applicationRole = applicationRole
+        self.relationshipID = relationshipID
+        self.createdAt = createdAt
+        self.feedback = feedback
+    }
+
+    var changed: Bool { sourceText != rewrittenText }
+}
+
+enum RewriteHistoryPolicy {
+    static let maximumEntries = 200
+    static let retentionInterval: TimeInterval = 180 * 86_400
+
+    static func retained(
+        _ entries: [RewriteHistoryEntry],
+        now: Date = Date()
+    ) -> [RewriteHistoryEntry] {
+        Array(
+            entries
+                .filter { now.timeIntervalSince($0.createdAt) <= retentionInterval }
+                .sorted { $0.createdAt < $1.createdAt }
+                .suffix(maximumEntries)
+        )
+    }
+
+    static func learnedMetrics(sourceText: String, rewrittenText: String) -> VoiceMetrics {
+        let source = VoiceAnalyzer.metrics(from: [sourceText])
+        let rewritten = VoiceAnalyzer.metrics(from: [rewrittenText])
+        // The user's draft is the strongest identity signal. The accepted
+        // rewrite contributes only enough weight to capture useful cleanup.
+        return VoiceAnalyzer.blend(rewritten, source, overlayWeight: 0.72)
+    }
+}
+
 struct SafetyPreferences: Codable, Equatable {
     var factIssueCount: Int = 0
     var preferredExpansionRatio: Double = 1.35
@@ -304,6 +368,7 @@ struct CommunicationPolicy: Codable, Equatable {
     let relationshipConfidence: Double
     let dimensions: RelationshipDimensions?
     let voice: VoiceMetrics
+    let voiceSampleCount: Int
     let customInstruction: String?
     let messageExpansionRatio: Double
 
@@ -322,6 +387,25 @@ struct CommunicationPolicy: Codable, Equatable {
         }
         if !voice.styleMarkers.isEmpty {
             lines.append("可保留的用户语气习惯：\(voice.styleMarkers.prefix(6).joined(separator: "、"))。")
+        }
+        if voiceSampleCount > 0 {
+            let sentencePreference: String
+            if voice.averageSentenceLength < 14 {
+                sentencePreference = "偏短句"
+            } else if voice.averageSentenceLength > 28 {
+                sentencePreference = "允许稍完整的长句"
+            } else {
+                sentencePreference = "中等句长"
+            }
+            let tonePreference = voice.formality < 0.38
+                ? "日常口语，不要正式化"
+                : (voice.formality > 0.62 ? "稍正式但不写成公文" : "自然、克制")
+            let directPreference = voice.directness > 0.68
+                ? "倾向直接表达"
+                : "保留适度缓和"
+            lines.append(
+                "本地个人画像摘要：\(sentencePreference)，\(tonePreference)，\(directPreference)。只模仿稳定风格，不复用历史中的事实或具体内容。"
+            )
         }
         if let customInstruction,
            !customInstruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -538,17 +622,35 @@ private extension Array where Element: Hashable {
 }
 
 private struct IntelligenceVaultPayload: Codable, Equatable {
-    var schemaVersion = 1
+    var schemaVersion = 2
     var relationships: [RelationshipProfile] = []
     var voice = VoiceProfile()
     var pendingRewrites: [PendingRewriteSample] = []
+    var rewriteHistory: [RewriteHistoryEntry] = []
     var safety = SafetyPreferences()
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, relationships, voice, pendingRewrites, rewriteHistory, safety
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
+        relationships = try container.decodeIfPresent([RelationshipProfile].self, forKey: .relationships) ?? []
+        voice = try container.decodeIfPresent(VoiceProfile.self, forKey: .voice) ?? VoiceProfile()
+        pendingRewrites = try container.decodeIfPresent([PendingRewriteSample].self, forKey: .pendingRewrites) ?? []
+        rewriteHistory = try container.decodeIfPresent([RewriteHistoryEntry].self, forKey: .rewriteHistory) ?? []
+        safety = try container.decodeIfPresent(SafetyPreferences.self, forKey: .safety) ?? SafetyPreferences()
+    }
 }
 
 final class CommunicationIntelligenceStore: ObservableObject {
     @Published private(set) var relationships: [RelationshipProfile]
     @Published private(set) var voice: VoiceProfile
     @Published private(set) var safety: SafetyPreferences
+    @Published private(set) var rewriteHistory: [RewriteHistoryEntry]
 
     private var payload: IntelligenceVaultPayload
     private let fileURL: URL
@@ -572,6 +674,8 @@ final class CommunicationIntelligenceStore: ObservableObject {
             injectedKey: encryptionKey
         )
         var initial = loaded ?? IntelligenceVaultPayload()
+        initial.schemaVersion = 2
+        initial.rewriteHistory = RewriteHistoryPolicy.retained(initial.rewriteHistory)
         if loaded == nil, !legacyProfiles.isEmpty {
             initial.relationships = legacyProfiles.map {
                 RelationshipProfile(
@@ -591,6 +695,7 @@ final class CommunicationIntelligenceStore: ObservableObject {
         self.payload = initial
         self.relationships = initial.relationships.sorted { $0.updatedAt > $1.updatedAt }
         self.voice = initial.voice
+        self.rewriteHistory = initial.rewriteHistory.sorted { $0.createdAt > $1.createdAt }
         self.safety = initial.safety
         if loaded == nil, !legacyProfiles.isEmpty, persist() {
             defaults.removeObject(forKey: ConversationProfileStore.storageKey)
@@ -740,16 +845,61 @@ final class CommunicationIntelligenceStore: ObservableObject {
     func clearAll() {
         relationships = []
         voice = VoiceProfile()
+        rewriteHistory = []
         safety = SafetyPreferences()
         payload = IntelligenceVaultPayload()
         try? FileManager.default.removeItem(at: fileURL)
         if injectedKey == nil { try? keyStore.delete() }
     }
 
+    @discardableResult
+    func recordRewrite(
+        sourceText: String,
+        rewrittenText: String,
+        applicationRole: ApplicationWritingRole,
+        relationshipID: UUID?,
+        conversationID: String?
+    ) -> UUID {
+        let entry = RewriteHistoryEntry(
+            sourceText: sourceText,
+            rewrittenText: rewrittenText,
+            applicationRole: applicationRole,
+            relationshipID: relationshipID
+        )
+        rewriteHistory.insert(entry, at: 0)
+        rewriteHistory = Array(
+            RewriteHistoryPolicy.retained(rewriteHistory).sorted { $0.createdAt > $1.createdAt }
+        )
+        if applicationRole == .messaging {
+            // Keep document, email and developer prose from diluting the voice
+            // profile used for instant messaging.
+            learnVoiceFromRewrite(entry)
+        }
+        recordPendingRewrite(
+            text: rewrittenText,
+            relationshipID: relationshipID,
+            conversationID: conversationID,
+            persistImmediately: false
+        )
+        syncAndPersist()
+        return entry.id
+    }
+
+    func deleteRewriteHistory(id: UUID) {
+        rewriteHistory.removeAll { $0.id == id }
+        syncAndPersist()
+    }
+
+    func clearRewriteHistory() {
+        rewriteHistory = []
+        syncAndPersist()
+    }
+
     func recordPendingRewrite(
         text: String,
         relationshipID: UUID?,
-        conversationID: String?
+        conversationID: String?,
+        persistImmediately: Bool = true
     ) {
         payload.pendingRewrites.removeAll { Date().timeIntervalSince($0.createdAt) > 86_400 }
         payload.pendingRewrites.append(
@@ -760,10 +910,25 @@ final class CommunicationIntelligenceStore: ObservableObject {
             )
         )
         payload.pendingRewrites = Array(payload.pendingRewrites.suffix(20))
-        _ = persist()
+        if persistImmediately { _ = persist() }
     }
 
-    func applyFeedback(_ feedback: RewriteFeedback, relationshipID: UUID?) {
+    func applyFeedback(
+        _ feedback: RewriteFeedback,
+        relationshipID: UUID?,
+        historyEntryID: UUID? = nil
+    ) {
+        if let historyEntryID,
+           let index = rewriteHistory.firstIndex(where: { $0.id == historyEntryID }) {
+            rewriteHistory[index].feedback = feedback
+            if feedback == .good {
+                let acceptedVoice = VoiceAnalyzer.metrics(from: [rewriteHistory[index].rewrittenText])
+                voice.metrics = VoiceAnalyzer.blend(voice.metrics, acceptedVoice, overlayWeight: 0.20)
+            } else if feedback == .notMyVoice {
+                let sourceVoice = VoiceAnalyzer.metrics(from: [rewriteHistory[index].sourceText])
+                voice.metrics = VoiceAnalyzer.blend(voice.metrics, sourceVoice, overlayWeight: 0.32)
+            }
+        }
         switch feedback {
         case .good:
             voice.metrics.directness = min(1, voice.metrics.directness + 0.01)
@@ -825,6 +990,41 @@ final class CommunicationIntelligenceStore: ObservableObject {
         }
         voice.updatedAt = Date()
         syncAndPersist()
+    }
+
+    private func learnVoiceFromRewrite(_ entry: RewriteHistoryEntry) {
+        let learned = RewriteHistoryPolicy.learnedMetrics(
+            sourceText: entry.sourceText,
+            rewrittenText: entry.rewrittenText
+        )
+        let previousCount = voice.sampleCount
+        let previousWeight = previousCount == 0
+            ? 0.0
+            : min(0.92, Double(previousCount) / Double(previousCount + 1))
+        voice.metrics = VoiceAnalyzer.blend(learned, voice.metrics, overlayWeight: previousWeight)
+        voice.sampleCount += 1
+        if let relationshipID = entry.relationshipID {
+            if let index = voice.relationshipOverlays.firstIndex(where: { $0.relationshipID == relationshipID }) {
+                let old = voice.relationshipOverlays[index]
+                let oldWeight = min(0.88, Double(old.sampleCount) / Double(old.sampleCount + 1))
+                voice.relationshipOverlays[index] = VoiceOverlay(
+                    relationshipID: relationshipID,
+                    sampleCount: old.sampleCount + 1,
+                    metrics: VoiceAnalyzer.blend(learned, old.metrics, overlayWeight: oldWeight),
+                    updatedAt: Date()
+                )
+            } else {
+                voice.relationshipOverlays.append(
+                    VoiceOverlay(
+                        relationshipID: relationshipID,
+                        sampleCount: 1,
+                        metrics: learned,
+                        updatedAt: Date()
+                    )
+                )
+            }
+        }
+        voice.updatedAt = Date()
     }
 
     private func learnFromPendingRewrites(
@@ -893,6 +1093,7 @@ final class CommunicationIntelligenceStore: ObservableObject {
     private func syncAndPersist() {
         payload.relationships = relationships
         payload.voice = voice
+        payload.rewriteHistory = rewriteHistory
         payload.safety = safety
         _ = persist()
     }
@@ -945,8 +1146,10 @@ final class CommunicationIntelligenceStore: ObservableObject {
             let cleartext = try AES.GCM.open(box, using: SymmetricKey(data: keyData))
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .millisecondsSince1970
-            let payload = try decoder.decode(IntelligenceVaultPayload.self, from: cleartext)
-            return payload.schemaVersion == 1 ? payload : nil
+            var payload = try decoder.decode(IntelligenceVaultPayload.self, from: cleartext)
+            guard (1...2).contains(payload.schemaVersion) else { return nil }
+            payload.schemaVersion = 2
+            return payload
         } catch {
             return nil
         }

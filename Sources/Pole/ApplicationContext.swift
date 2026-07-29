@@ -1,6 +1,6 @@
 import Foundation
 
-enum ApplicationWritingRole: String, Equatable {
+enum ApplicationWritingRole: String, Codable, Equatable {
     case aiDevelopmentAssistant
     case aiAssistant
     case messaging

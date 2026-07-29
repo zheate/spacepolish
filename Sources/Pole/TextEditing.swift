@@ -74,7 +74,11 @@ enum TextSelectionResolver {
         }
 
         guard let copiedSelection, !copiedSelection.isEmpty else {
-            return NSRange(location: original.length, length: 0)
+            // When neither Accessibility nor the clipboard can report the
+            // selection, we cannot distinguish "no selection" from a failed
+            // selection read. Never turn that uncertainty into a whole-field
+            // rewrite.
+            throw TextEditingError.selectionUnavailable
         }
 
         let first = original.range(of: copiedSelection)
@@ -93,6 +97,27 @@ enum TextSelectionResolver {
             }
         }
         return first
+    }
+}
+
+enum KeyboardCaptureSelectionResolver {
+    static func resolve(
+        text: String,
+        copiedSelection: String?,
+        accessibilityRange: NSRange?
+    ) throws -> NSRange {
+        if accessibilityRange == nil,
+           copiedSelection == nil || copiedSelection?.isEmpty == true {
+            // A successful whole-field keyboard read proves that copy/paste is
+            // working in this editor. If copying before Select All produced no
+            // text, custom editors such as WeChat had no active selection.
+            return NSRange(location: (text as NSString).length, length: 0)
+        }
+        return try TextSelectionResolver.resolve(
+            text: text,
+            copiedSelection: copiedSelection,
+            accessibilityRange: accessibilityRange
+        )
     }
 }
 
@@ -512,12 +537,25 @@ struct AccessibilityTextService {
             throw TextEditingError.unsupportedTextField
         }
 
-        let plan = try TextRangePlanner.plan(
+        var selectedTextRef: CFTypeRef?
+        let selectedText = AXUIElementCopyAttributeValue(
+            element,
+            kAXSelectedTextAttribute as CFString,
+            &selectedTextRef
+        ) == .success
+            ? selectedTextRef as? String
+            : nil
+        let resolvedRange = try TextSelectionResolver.resolve(
             text: text,
-            selectedRange: NSRange(
+            copiedSelection: selectedText,
+            accessibilityRange: NSRange(
                 location: selectedRange.location,
                 length: selectedRange.length
             )
+        )
+        let plan = try TextRangePlanner.plan(
+            text: text,
+            selectedRange: resolvedRange
         )
 
         return CapturedTextContext(target: .accessibility(element), plan: plan)
@@ -825,7 +863,7 @@ private enum KeyboardTextFallback {
             processIdentifier: processIdentifier
         )
         let text = try readAllText(processIdentifier: processIdentifier)
-        let selectedRange = try TextSelectionResolver.resolve(
+        let selectedRange = try KeyboardCaptureSelectionResolver.resolve(
             text: text,
             copiedSelection: copiedSelection,
             accessibilityRange: accessibilityRange
@@ -833,6 +871,11 @@ private enum KeyboardTextFallback {
         let plan = try TextRangePlanner.plan(
             text: text,
             selectedRange: selectedRange
+        )
+        try? restoreSelection(
+            selectedRange,
+            in: text,
+            processIdentifier: processIdentifier
         )
         return CapturedTextContext(
             target: .keyboard(processIdentifier: processIdentifier),
@@ -911,6 +954,93 @@ private enum KeyboardTextFallback {
             return nil
         }
         return NSRange(location: range.location, length: range.length)
+    }
+
+    private static func restoreSelection(
+        _ range: NSRange,
+        in text: String,
+        processIdentifier: pid_t
+    ) throws {
+        let textLength = (text as NSString).length
+        guard UTF16TextRangeValidator.isValid(range, forLength: textLength) else { return }
+        if range.location == textLength, range.length == 0 {
+            return
+        }
+
+        try ensureFrontmost(processIdentifier)
+        if setFocusedSelectedRange(range, processIdentifier: processIdentifier) {
+            return
+        }
+
+        guard let swiftRange = Range(range, in: text) else { return }
+        let prefixCount = text[..<swiftRange.lowerBound].count
+        let selectionCount = text[swiftRange].count
+        guard prefixCount + selectionCount <= 1_000 else { return }
+
+        try performShortcut(
+            keyCode: 0,
+            modifiers: .maskCommand,
+            processIdentifier: processIdentifier
+        )
+        if range.location == 0, range.length == textLength {
+            return
+        }
+
+        try performShortcut(
+            keyCode: 123,
+            modifiers: [],
+            processIdentifier: processIdentifier
+        )
+        for _ in 0..<prefixCount {
+            try performShortcut(
+                keyCode: 124,
+                modifiers: [],
+                processIdentifier: processIdentifier
+            )
+        }
+        for _ in 0..<selectionCount {
+            try performShortcut(
+                keyCode: 124,
+                modifiers: .maskShift,
+                processIdentifier: processIdentifier
+            )
+        }
+    }
+
+    private static func setFocusedSelectedRange(
+        _ range: NSRange,
+        processIdentifier: pid_t
+    ) -> Bool {
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            systemWide,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedRef
+        ) == .success,
+              let focusedRef else {
+            return false
+        }
+
+        let focusedElement = focusedRef as! AXUIElement
+        var focusedProcessIdentifier: pid_t = 0
+        guard AXUIElementGetPid(
+            focusedElement,
+            &focusedProcessIdentifier
+        ) == .success,
+              focusedProcessIdentifier == processIdentifier else {
+            return false
+        }
+
+        var mutableRange = CFRange(location: range.location, length: range.length)
+        guard let rangeValue = AXValueCreate(.cfRange, &mutableRange) else {
+            return false
+        }
+        return AXUIElementSetAttributeValue(
+            focusedElement,
+            kAXSelectedTextRangeAttribute as CFString,
+            rangeValue
+        ) == .success
     }
 
     static func replace(

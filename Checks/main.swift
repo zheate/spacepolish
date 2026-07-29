@@ -324,6 +324,61 @@ do {
 }
 
 do {
+    let input = "开头保持，只优化这里，结尾保持"
+    let expected = (input as NSString).range(of: "只优化这里")
+    let resolved = try TextSelectionResolver.resolve(
+        text: input,
+        copiedSelection: "只优化这里",
+        accessibilityRange: NSRange(location: NSMaxRange(expected), length: 0)
+    )
+    check(
+        resolved == expected,
+        "辅助功能范围错误折叠时仍根据真实选中文字局部优化"
+    )
+} catch {
+    failures += 1
+    print("FAIL  折叠选区恢复抛出异常：\(error)")
+}
+
+expectThrow("选区状态不可读时拒绝误判为全文优化") {
+    _ = try TextSelectionResolver.resolve(
+        text: "不能确定是否存在选区",
+        copiedSelection: nil,
+        accessibilityRange: nil
+    )
+}
+
+do {
+    let input = "微信输入框无选区"
+    let resolved = try KeyboardCaptureSelectionResolver.resolve(
+        text: input,
+        copiedSelection: nil,
+        accessibilityRange: nil
+    )
+    check(
+        resolved == NSRange(location: (input as NSString).length, length: 0),
+        "键盘回退成功读取全文后允许无选区处理"
+    )
+} catch {
+    failures += 1
+    print("FAIL  键盘回退无选区解析异常：\(error)")
+}
+
+do {
+    let input = "开头保持，只优化这里，结尾保持"
+    let expected = (input as NSString).range(of: "只优化这里")
+    let resolved = try KeyboardCaptureSelectionResolver.resolve(
+        text: input,
+        copiedSelection: "只优化这里",
+        accessibilityRange: nil
+    )
+    check(resolved == expected, "键盘回退仍优先处理真实局部选区")
+} catch {
+    failures += 1
+    print("FAIL  键盘回退局部选区解析异常：\(error)")
+}
+
+do {
     check(OptionKeySide(keyCode: 58) == .left, "识别左 Option 键码")
     check(OptionKeySide(keyCode: 61) == .right, "识别右 Option 键码")
     check(OptionKeySide(keyCode: 59) == nil, "忽略非 Option 键码")
@@ -636,6 +691,7 @@ let neutralCommunicationPolicy = CommunicationPolicy(
     relationshipConfidence: 0,
     dimensions: nil,
     voice: VoiceMetrics(),
+    voiceSampleCount: 0,
     customInstruction: nil,
     messageExpansionRatio: 1.35
 )
@@ -644,6 +700,30 @@ check(
         && neutralCommunicationPolicy.modelInstruction.contains("只有原文已经自然准确时才保持不变")
         && !neutralCommunicationPolicy.modelInstruction.contains("只做最小必要修改"),
     "沟通策略不会抵消主动优化规则"
+)
+
+let learnedCommunicationPolicy = CommunicationPolicy(
+    intent: .casual,
+    relationshipRole: nil,
+    relationshipConfidence: 0,
+    dimensions: nil,
+    voice: VoiceMetrics(
+        averageSentenceLength: 10,
+        emojiRate: 0,
+        exclamationRate: 0,
+        formality: 0.25,
+        directness: 0.78,
+        detail: 0.35,
+        styleMarkers: ["哈哈", "行"]
+    ),
+    voiceSampleCount: 8,
+    customInstruction: nil,
+    messageExpansionRatio: 1.35
+)
+check(
+    learnedCommunicationPolicy.modelInstruction.contains("本地个人画像摘要")
+        && learnedCommunicationPolicy.modelInstruction.contains("不复用历史中的事实"),
+    "个人画像以不含历史正文的风格摘要进入提示词"
 )
 
 check(
@@ -982,6 +1062,30 @@ if let encodedFingerprint = try? JSONEncoder().encode(fingerprintSample) {
     check(false, "待匹配成稿指纹可以编码")
 }
 
+let learnedHistoryMetrics = RewriteHistoryPolicy.learnedMetrics(
+    sourceText: "哈哈，行，我再看一下",
+    rewrittenText: "行，我再看一下。"
+)
+check(
+    learnedHistoryMetrics.styleMarkers.contains("哈哈") || learnedHistoryMetrics.styleMarkers.contains("行"),
+    "优化历史画像优先保留用户原稿的稳定语气"
+)
+
+let historyNow = Date()
+let retainedHistory = RewriteHistoryPolicy.retained(
+    (0..<205).map { index in
+        RewriteHistoryEntry(
+            sourceText: "原文\(index)",
+            rewrittenText: "结果\(index)",
+            applicationRole: .messaging,
+            relationshipID: nil,
+            createdAt: historyNow.addingTimeInterval(TimeInterval(index))
+        )
+    },
+    now: historyNow.addingTimeInterval(205)
+)
+check(retainedHistory.count == 200, "优化历史最多保留 200 条")
+
 let safeRewrite = StructuredRewriteResult(
     rewrittenText: "项目可能延期两周，因为供应商接口还没完成。",
     intent: .inform,
@@ -1131,6 +1235,55 @@ do {
         encryptionKey: key
     )
     check(reloaded.relationships.first?.role == .manager, "AES-GCM 画像库可以重新加载")
+
+    let historyVaultURL = tempDirectory.appendingPathComponent("history-vault.dat")
+    let historyStore = CommunicationIntelligenceStore(
+        defaults: defaults,
+        fileURL: historyVaultURL,
+        encryptionKey: key
+    )
+    let historyID = historyStore.recordRewrite(
+        sourceText: "哈哈，这个我再看看",
+        rewrittenText: "哈哈，这个我再看一下",
+        applicationRole: .messaging,
+        relationshipID: nil,
+        conversationID: nil
+    )
+    check(historyStore.rewriteHistory.count == 1, "成功润色写入本地优化历史")
+    check(historyStore.voice.sampleCount == 1, "优化历史立即形成声音画像样本")
+    _ = historyStore.recordRewrite(
+        sourceText: "运行 swift build 看一下",
+        rewrittenText: "运行 swift build 检查构建结果",
+        applicationRole: .development,
+        relationshipID: nil,
+        conversationID: nil
+    )
+    check(
+        historyStore.rewriteHistory.count == 2 && historyStore.voice.sampleCount == 1,
+        "开发和文档历史不会污染聊天声音画像"
+    )
+    let encryptedHistory = try Data(contentsOf: historyVaultURL)
+    let encryptedHistoryText = String(decoding: encryptedHistory, as: UTF8.self)
+    check(
+        !encryptedHistoryText.contains("这个我再看看") && !encryptedHistoryText.contains("这个我再看一下"),
+        "优化历史原文和结果不会明文落盘"
+    )
+    let reloadedHistoryStore = CommunicationIntelligenceStore(
+        defaults: defaults,
+        fileURL: historyVaultURL,
+        encryptionKey: key
+    )
+    check(
+        reloadedHistoryStore.rewriteHistory.contains { $0.sourceText == "哈哈，这个我再看看" },
+        "加密优化历史可以重新加载"
+    )
+    reloadedHistoryStore.applyFeedback(.good, relationshipID: nil, historyEntryID: historyID)
+    check(
+        reloadedHistoryStore.rewriteHistory.first(where: { $0.id == historyID })?.feedback == .good,
+        "最近一次反馈会写回对应历史"
+    )
+    reloadedHistoryStore.clearRewriteHistory()
+    check(reloadedHistoryStore.rewriteHistory.isEmpty, "优化历史可以单独清空")
     var changedProbabilities = RoleProbabilities()
     changedProbabilities.customer = 0.86
     changedProbabilities.manager = 0.18
