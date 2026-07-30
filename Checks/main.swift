@@ -424,12 +424,47 @@ check(
     "通用回退保留微信支持"
 )
 check(
-    !KeyboardFallbackPolicy.allows(bundleIdentifier: "com.apple.Terminal"),
-    "通用回退排除终端"
+    KeyboardFallbackPolicy.allows(bundleIdentifier: "com.apple.Terminal"),
+    "通用回退允许终端"
 )
 check(
     !KeyboardFallbackPolicy.allows(bundleIdentifier: "com.spacepolish.mac"),
     "通用回退排除自身"
+)
+check(
+    KeyboardFallbackPolicy.shouldRetryCapture(
+        after: .noTextToOptimize,
+        bundleIdentifier: "com.tencent.xinWeChat"
+    ),
+    "微信辅助功能返回空文本时切换键盘回退"
+)
+check(
+    KeyboardFallbackPolicy.shouldRetryCapture(
+        after: .selectionUnavailable,
+        bundleIdentifier: "com.tencent.WeWorkMac"
+    ),
+    "企业微信选区语义不可靠时切换键盘回退"
+)
+check(
+    !KeyboardFallbackPolicy.shouldRetryCapture(
+        after: .noTextToOptimize,
+        bundleIdentifier: "com.openai.codex"
+    ),
+    "标准编辑器的空输入不会触发侵入式键盘读取"
+)
+check(
+    KeyboardFallbackPolicy.shouldRetryWriteback(
+        after: .readOnlyTextField,
+        bundleIdentifier: "com.tencent.xinWeChat"
+    ),
+    "微信辅助功能值只读时允许安全键盘写回"
+)
+check(
+    !KeyboardFallbackPolicy.shouldRetryWriteback(
+        after: .textChangedWhileWaiting,
+        bundleIdentifier: "com.tencent.xinWeChat"
+    ),
+    "等待期间文本变化时仍禁止回退覆盖"
 )
 
 check(
@@ -466,13 +501,26 @@ check(
     "空白自定义提示词回退到安全默认值"
 )
 check(
-    PromptPolicy.polishPrompt(basePrompt: "基础规则", contextInstruction: nil) == "基础规则",
-    "没有场景规则时保持原提示词"
+    PromptPolicy.polishPrompt(basePrompt: "基础规则", contextInstruction: nil)
+        .contains("基础规则"),
+    "没有场景规则时保留原提示词"
 )
 check(
     PromptPolicy.polishPrompt(basePrompt: " \n", contextInstruction: nil)
-        == PromptPolicy.currentDefault,
+        .contains(PromptPolicy.currentDefault),
     "请求阶段不会发送空白系统提示词"
+)
+let chineseEditingPrompt = PromptPolicy.polishPrompt(
+    basePrompt: "基础规则",
+    contextInstruction: "聊天规则"
+)
+check(
+    chineseEditingPrompt.contains("成分残缺或赘余")
+        && chineseEditingPrompt.contains("词义、词性、固定搭配、语域、领域常用表达")
+        && chineseEditingPrompt.contains("发现多处问题时逐一修正")
+        && chineseEditingPrompt.contains("禁止附加“优化说明”")
+        && chineseEditingPrompt.contains("聊天规则"),
+    "润色请求包含中文语法、词语搭配和原文对齐规则"
 )
 check(
     PromptPolicy.currentDefault.contains("保持原文的确定程度")
@@ -488,6 +536,101 @@ check(
         && !PromptPolicy.currentDefault.contains("优先原样输出"),
     "新版提示词兼顾信息保留和主动有效修改"
 )
+let opticsSemanticMatches = SemanticLibraryCatalog.matches(
+    in: "780 nm 激光经过准直后，光斑直径和 M² 都需要复测。"
+)
+check(
+    opticsSemanticMatches.first?.id == .opticsAndLaser,
+    "光学术语会命中光学与激光语义库"
+)
+let manufacturingSemanticMatches = SemanticLibraryCatalog.matches(
+    in: "BOM 还在备料，CAPA 关闭前不要转量产。"
+)
+check(
+    manufacturingSemanticMatches.contains(where: { $0.id == .manufacturingAndQuality }),
+    "BOM、备料和 CAPA 会命中制造与质量语义库"
+)
+let embeddedSemanticMatches = SemanticLibraryCatalog.matches(
+    in: "新的 I2C 驱动不稳定，上电后 SDA 引脚会导致通信中断。"
+)
+check(
+    embeddedSemanticMatches.first?.id == .embeddedHardware,
+    "I2C、SDA、上电和通信中断会命中嵌入式语义库"
+)
+let embeddedInstruction = SemanticLibraryCatalog.modelInstruction(
+    for: "测试 I2C 模块时，加电后 SDA 通讯中断。"
+) ?? ""
+check(
+    embeddedInstruction.contains("嵌入式与硬件")
+        && embeddedInstruction.contains("上电")
+        && embeddedInstruction.contains("通讯")
+        && embeddedInstruction.contains("通信会突然中断")
+        && embeddedInstruction.contains("通信中断与硬件中断"),
+    "嵌入式语义库提供领域术语和歧义保护"
+)
+check(
+    SemanticLibraryCatalog.matches(in: "项目").isEmpty,
+    "单个宽泛词不会误触发项目语义库"
+)
+check(
+    SemanticLibraryCatalog.matches(
+        in: "这个 API 的 JSON 返回值需要调整。",
+        enabled: [.opticsAndLaser]
+    ).isEmpty,
+    "关闭的软件开发语义库不会参与匹配"
+)
+check(
+    SemanticLibraryCatalog.matches(in: "capability").isEmpty,
+    "英文缩写按完整词匹配，避免 API 子串误判"
+)
+let mixedSemanticInstruction = SemanticLibraryCatalog.modelInstruction(
+    for: "激光 BOM 交期 报价 API"
+) ?? ""
+check(
+    mixedSemanticInstruction.contains("光学与激光")
+        && mixedSemanticInstruction.contains("制造与质量")
+        && mixedSemanticInstruction.contains("项目与交付")
+        && !mixedSemanticInstruction.contains("软件开发"),
+    "一次最多注入三个最相关语义库，控制提示词长度"
+)
+check(
+    SemanticLibraryCatalog.protectedTerms(in: "请确认 BOM、M² 和 NA=0.22")
+        == ["M²", "NA", "BOM"],
+    "高风险专业缩写会进入本地受保护内容"
+)
+check(
+    SemanticLibraryCatalog.protectedTerms(
+        in: "请确认 API 返回的 JSON",
+        enabled: [.opticsAndLaser]
+    ).isEmpty,
+    "关闭语义库后不再添加该库的受保护术语"
+)
+let semanticDefaultsName = "PoleChecks.SemanticLibraries.\(UUID().uuidString)"
+if let semanticDefaults = UserDefaults(suiteName: semanticDefaultsName) {
+    semanticDefaults.removePersistentDomain(forName: semanticDefaultsName)
+    check(
+        SemanticLibraryPreferences.load(from: semanticDefaults)
+            == SemanticLibraryID.defaultEnabled,
+        "首次使用时默认启用全部内置语义库"
+    )
+    SemanticLibraryPreferences.save([.opticsAndLaser, .softwareDevelopment], to: semanticDefaults)
+    check(
+        SemanticLibraryPreferences.load(from: semanticDefaults)
+            == [.opticsAndLaser, .softwareDevelopment],
+        "语义库开关可以持久化"
+    )
+    semanticDefaults.set(
+        [SemanticLibraryID.opticsAndLaser.rawValue],
+        forKey: SemanticLibraryPreferences.defaultsKey
+    )
+    semanticDefaults.removeObject(forKey: "semanticLibraryCatalogVersion")
+    check(
+        SemanticLibraryPreferences.load(from: semanticDefaults)
+            == [.opticsAndLaser, .embeddedHardware],
+        "升级后默认启用新增的嵌入式语义库，同时保留原有开关"
+    )
+    semanticDefaults.removePersistentDomain(forName: semanticDefaultsName)
+}
 check(
     TranslationPolicy.prompt.contains("主要是中文")
         && TranslationPolicy.prompt.contains("简体中文")
@@ -518,6 +661,47 @@ do {
     failures += 1
     print("FAIL  模型结果边界清理抛出异常：\(error)")
 }
+do {
+    let response = """
+    俞博，新的 I2C 驱动不太稳定。下午测试了几台模块，上电过程中通信会突然中断，之后持续报错。初步怀疑 SDA 引脚存在故障，板子已经寄给明义微进一步排查。
+
+    优化说明：
+    1. 将“通讯”改为“通信”。
+    2. 调整语序。
+    """
+    let preparedResponse = try RewriteResultPolicy.prepare(
+        response,
+        preservingBoundaryWhitespaceOf: "俞博，新的 I2C 驱动不太稳定。"
+    )
+    check(
+        preparedResponse == "俞博，新的 I2C 驱动不太稳定。下午测试了几台模块，上电过程中通信会突然中断，之后持续报错。初步怀疑 SDA 引脚存在故障，板子已经寄给明义微进一步排查。",
+        "模型附加的优化说明不会写回输入框"
+    )
+} catch {
+    failures += 1
+    print("FAIL  优化说明清理抛出异常：\(error)")
+}
+do {
+    let preparedResponse = try RewriteResultPolicy.prepare(
+        "优化后的文本：上电过程中通信会突然中断。",
+        preservingBoundaryWhitespaceOf: "加电过程中会突然通讯中断。"
+    )
+    check(preparedResponse == "上电过程中通信会突然中断。", "模型结果标题不会写回输入框")
+} catch {
+    failures += 1
+    print("FAIL  模型结果标题清理抛出异常：\(error)")
+}
+do {
+    let source = "优化说明：请保留 I2C 和 SDA。"
+    let preparedResponse = try RewriteResultPolicy.prepare(
+        source,
+        preservingBoundaryWhitespaceOf: source
+    )
+    check(preparedResponse == source, "原文本身的优化说明标题不会被误删")
+} catch {
+    failures += 1
+    print("FAIL  合法说明标题保护抛出异常：\(error)")
+}
 expectThrow("模型结果拒绝纯空白内容") {
     _ = try RewriteResultPolicy.prepare(
         " \n\t",
@@ -542,6 +726,31 @@ check(
         result: "请重新整理这段表达，使其更清晰自然"
     ) == .complete,
     "明显改写归类为完整优化"
+)
+check(
+    InputProgressSoundCue.result(
+        for: .complete,
+        operation: .optimization
+    ) == .completion,
+    "完成优化使用确认音"
+)
+check(
+    InputProgressSoundCue.result(
+        for: .unchanged,
+        operation: .optimization
+    ) == .unchanged,
+    "无需修改使用轻提示音"
+)
+check(
+    InputProgressSoundCue.result(
+        for: .unchanged,
+        operation: .translation
+    ) == .completion,
+    "翻译完成始终使用确认音"
+)
+check(
+    InputProgressSoundCue.completion.soundName == "Glass",
+    "完成态使用灯泡点亮感的清亮音效"
 )
 check(
     QwenClient.requestTimeout(for: "短消息", isRetry: false) == 20,
@@ -1167,6 +1376,97 @@ check(
         expansionRatio: 1.35
     ).accepted,
     "事实守卫不把模型自报字段当作硬拒绝依据"
+)
+check(
+    FactGuard.audit(
+        sourceText: "你先把材料发给客户，然后再回复我",
+        result: StructuredRewriteResult(rewrittenText: "材料给客户发过去后再回我一下"),
+        applicationRole: .messaging,
+        expansionRatio: 1.35
+    ).accepted,
+    "事实守卫接受保留动作和先后关系的自然聊天改写"
+)
+check(
+    MessagingRewriteRetryPolicy.shouldRetryUnchanged(
+        sourceText: "这个方案我再看看",
+        candidate: "这个方案我再看看"
+    ),
+    "较完整聊天原样返回时再尝试一次有效改写"
+)
+check(
+    !MessagingRewriteRetryPolicy.shouldRetryUnchanged(
+        sourceText: "好的",
+        candidate: "好的"
+    ),
+    "自然短回复不为制造变化而重复请求"
+)
+check(
+    RewriteAlignmentGuard.audit(
+        sourceText: "周总，和俞博讨论了一下，上述指标做不到，原理上好像不对。",
+        outputText: "周总，我和俞博讨论了下，这个指标从原理上看应该做不到。",
+        applicationRole: .messaging
+    ).accepted,
+    "原文锚点充分保留的自然中文改写通过对齐审计"
+)
+check(
+    !RewriteAlignmentGuard.audit(
+        sourceText: "请先确认供应商报价，再核对交期，最后把结果同步给项目组。",
+        outputText: "我们已经制定了新的执行方案，团队会全力推进后续工作。",
+        applicationRole: .messaging
+    ).accepted,
+    "与原文低对齐且引入大量新词句的结果会被拒绝"
+)
+check(
+    !RewriteAlignmentGuard.audit(
+        sourceText: "请先确认供应商报价，再核对交期，最后把结果同步给项目组。",
+        outputText: "尽快处理。",
+        applicationRole: .messaging
+    ).accepted,
+    "大幅压缩并删除必要信息的结果会被拒绝"
+)
+check(
+    RewriteAlignmentGuard.audit(
+        sourceText: "我认为这个方案暂时还不能确定，需要继续验证后再决定。",
+        outputText: "这个方案目前还无法确定，需继续验证后再决定。",
+        applicationRole: .document
+    ).accepted,
+    "保留含义的正常语法和词语优化不会被对齐审计误拒绝"
+)
+check(
+    !RewriteHighlightPlanner.plan(
+        sourceText: "无需修改",
+        outputText: "无需修改"
+    ).hasChanges,
+    "相同文本不显示优化高亮"
+)
+let embeddedHighlightPlan = RewriteHighlightPlanner.plan(
+    sourceText: "加电过程中会突然通讯中断，随后一直报错。",
+    outputText: "上电过程中通信会突然中断，随后持续报错。"
+)
+check(
+    embeddedHighlightPlan.hasChanges && embeddedHighlightPlan.changeCount >= 3,
+    "嵌入式术语、语序和搭配修改会形成多处高亮"
+)
+let embeddedHighlightText = "上电过程中通信会突然中断，随后持续报错。" as NSString
+check(
+    embeddedHighlightPlan.ranges.allSatisfy {
+        UTF16TextRangeValidator.isValid($0, forLength: embeddedHighlightText.length)
+    },
+    "所有优化高亮范围都使用有效的结果文本 UTF-16 坐标"
+)
+check(
+    RewriteHighlightPlanner.plan(
+        sourceText: "正文。怎么优化？",
+        outputText: "正文。"
+    ).ranges == [NSRange(location: 3, length: 0)],
+    "纯删除会在结果中的删除位置生成零宽高亮"
+)
+check(
+    RewriteHighlightPlanner.plan(
+        sourceText: "A🙂B",
+        outputText: "A😀B"
+    ).ranges == [NSRange(location: 1, length: 2)],
+    "优化高亮范围正确处理 emoji 的 UTF-16 长度"
 )
 do {
     let decoded = try JSONDecoder().decode(

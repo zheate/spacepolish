@@ -5,6 +5,22 @@ enum InputProgressOperation {
     case translation
 }
 
+enum InputProgressSoundCue: Equatable {
+    case completion
+    case unchanged
+    case failure
+
+    static func result(
+        for outcome: OptimizationOutcome,
+        operation: InputProgressOperation
+    ) -> InputProgressSoundCue {
+        if case .translation = operation {
+            return .completion
+        }
+        return outcome == .unchanged ? .unchanged : .completion
+    }
+}
+
 enum InputProgressMoveStyle: Equatable {
     case immediate
     case eased
@@ -52,12 +68,15 @@ final class InputProgressIndicator {
 
     private let indicator: ProgressIndicatorView
     private let panel: NSPanel
+    private let soundPlayer = InputProgressSoundPlayer()
+    private let isSoundEnabled: () -> Bool
     private var dismissalWorkItem: DispatchWorkItem?
     private var presentationGeneration = 0
     private var movementGeneration = 0
     private var reducesMotion = false
 
-    init() {
+    init(isSoundEnabled: @escaping () -> Bool = { true }) {
+        self.isSoundEnabled = isSoundEnabled
         let indicator = ProgressIndicatorView(
             frame: NSRect(origin: .zero, size: Self.indicatorSize)
         )
@@ -233,16 +252,25 @@ final class InputProgressIndicator {
         case (.optimization, .partial), (.optimization, .complete):
             accessibilityDescription = "优化完成"
         }
-        showResult(state, accessibilityDescription: accessibilityDescription)
+        showResult(
+            state,
+            accessibilityDescription: accessibilityDescription,
+            soundCue: .result(for: outcome, operation: operation)
+        )
     }
 
     func fail() {
-        showResult(.failed, accessibilityDescription: "处理失败")
+        showResult(
+            .failed,
+            accessibilityDescription: "处理失败",
+            soundCue: .failure
+        )
     }
 
     private func showResult(
         _ state: IndicatorVisualState,
-        accessibilityDescription: String
+        accessibilityDescription: String,
+        soundCue: InputProgressSoundCue
     ) {
         guard panel.isVisible else {
             hide()
@@ -250,6 +278,9 @@ final class InputProgressIndicator {
         }
 
         dismissalWorkItem?.cancel()
+        if isSoundEnabled() {
+            soundPlayer.play(soundCue)
+        }
         indicator.showResult(state, accessibilityDescription: accessibilityDescription)
 
         let generation = presentationGeneration
@@ -351,6 +382,42 @@ final class InputProgressIndicator {
         dismissalWorkItem?.cancel()
         indicator.stopAnimating()
         panel.orderOut(nil)
+    }
+}
+
+private final class InputProgressSoundPlayer {
+    private var activeSound: NSSound?
+
+    func play(_ cue: InputProgressSoundCue) {
+        activeSound?.stop()
+        guard let sound = NSSound(named: cue.soundName) else { return }
+        sound.volume = cue.volume
+        activeSound = sound
+        sound.play()
+    }
+}
+
+extension InputProgressSoundCue {
+    var soundName: NSSound.Name {
+        switch self {
+        case .completion:
+            return NSSound.Name("Glass")
+        case .unchanged:
+            return NSSound.Name("Tink")
+        case .failure:
+            return NSSound.Name("Funk")
+        }
+    }
+
+    var volume: Float {
+        switch self {
+        case .completion:
+            return 0.32
+        case .unchanged:
+            return 0.20
+        case .failure:
+            return 0.24
+        }
     }
 }
 

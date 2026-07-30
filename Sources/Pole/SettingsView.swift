@@ -11,6 +11,23 @@ final class SettingsWindowController: NSWindowController {
     private let promptTextView = NSTextView()
     private let intervalSlider = NSSlider(value: 1.2, minValue: 0.5, maxValue: 2.0, target: nil, action: nil)
     private let intervalLabel = NSTextField(labelWithString: "1.2 秒")
+    private let soundEffectsCheckbox = NSButton(
+        checkboxWithTitle: "处理完成或失败时播放轻提示音",
+        target: nil,
+        action: nil
+    )
+    private lazy var semanticLibraryCheckboxes: [SemanticLibraryID: NSButton] = {
+        Dictionary(uniqueKeysWithValues: SemanticLibraryID.allCases.map { id in
+            (
+                id,
+                NSButton(
+                    checkboxWithTitle: id.displayName,
+                    target: nil,
+                    action: nil
+                )
+            )
+        })
+    }()
     private let permissionLabel = NSTextField(labelWithString: "")
     private let screenCapturePermissionLabel = NSTextField(labelWithString: "")
     private let helperPathLabel = NSTextField(wrappingLabelWithString: "未配置本地 helper")
@@ -73,6 +90,7 @@ final class SettingsWindowController: NSWindowController {
         let tabs = NSTabView()
         tabs.tabViewType = .topTabsBezelBorder
         tabs.addTabViewItem(tabItem(label: "通用", view: buildGeneralTab()))
+        tabs.addTabViewItem(tabItem(label: "语义库", view: buildSemanticLibrariesTab()))
         tabs.addTabViewItem(tabItem(label: "沟通智能", view: buildIntelligenceTab()))
         tabs.addTabViewItem(tabItem(label: "优化历史", view: rewriteHistoryView))
         tabs.addTabViewItem(tabItem(label: "聊天对象", view: buildRelationshipsTab()))
@@ -154,10 +172,44 @@ final class SettingsWindowController: NSWindowController {
         ], spacing: 10)
         let rulesBox = makeBox(
             title: "基础优化规则",
-            content: verticalStack([promptScroll, intervalRow], spacing: 12),
-            height: 225
+            content: verticalStack([promptScroll, intervalRow, soundEffectsCheckbox], spacing: 12),
+            height: 252
         )
         pin(verticalStack([qwenBox, rulesBox], spacing: 16), in: content)
+        return content
+    }
+
+    private func buildSemanticLibrariesTab() -> NSView {
+        let content = tabContainer()
+        let intro = secondaryLabel(
+            "Pole 会在本机判断当前文本属于哪些专业语境，只把命中的保护规则加入本次润色。未命中的库不会增加提示词长度。"
+        )
+        let rows = SemanticLibraryID.allCases.compactMap { id -> NSView? in
+            guard let checkbox = semanticLibraryCheckboxes[id] else { return nil }
+            let summary = secondaryLabel(id.summary)
+            summary.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            let row = verticalStack([checkbox, summary], spacing: 2)
+            row.setContentHuggingPriority(.required, for: .vertical)
+            row.setContentCompressionResistancePriority(.required, for: .vertical)
+            return row
+        }
+        let privacy = secondaryLabel(
+            "匹配在本机完成，不保存命中记录；语义库只保护原文已有含义，不会补写参数、结论、承诺或业务事实。"
+        )
+        intro.setContentHuggingPriority(.required, for: .vertical)
+        privacy.setContentHuggingPriority(.required, for: .vertical)
+        let libraryContent = verticalStack(
+            [intro] + rows + [privacy],
+            spacing: 10
+        )
+        libraryContent.distribution = .fill
+        let libraryBox = makeBox(
+            title: "内置专业语义库",
+            content: libraryContent,
+            height: 390,
+            fillsHeight: false
+        )
+        pin(libraryBox, in: content)
         return content
     }
 
@@ -293,7 +345,12 @@ final class SettingsWindowController: NSWindowController {
         }
     }
 
-    private func makeBox(title: String, content: NSView, height: CGFloat) -> NSBox {
+    private func makeBox(
+        title: String,
+        content: NSView,
+        height: CGFloat,
+        fillsHeight: Bool = true
+    ) -> NSBox {
         let box = NSBox()
         box.title = title
         box.titlePosition = .atTop
@@ -303,12 +360,17 @@ final class SettingsWindowController: NSWindowController {
         box.contentView = container
         content.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(content)
-        NSLayoutConstraint.activate([
+        var constraints = [
             content.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 12),
             content.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
-            content.topAnchor.constraint(equalTo: container.topAnchor, constant: 12),
-            content.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12)
-        ])
+            content.topAnchor.constraint(equalTo: container.topAnchor, constant: 12)
+        ]
+        constraints.append(
+            fillsHeight
+                ? content.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12)
+                : content.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor, constant: -12)
+        )
+        NSLayoutConstraint.activate(constraints)
         return box
     }
 
@@ -351,6 +413,12 @@ final class SettingsWindowController: NSWindowController {
         modelPicker.selectItem(at: model.modelName == "qwen3.6-flash" ? 1 : 0)
         promptTextView.string = model.prompt
         intervalSlider.doubleValue = model.triggerInterval
+        soundEffectsCheckbox.state = model.soundEffectsEnabled ? .on : .off
+        for id in SemanticLibraryID.allCases {
+            semanticLibraryCheckboxes[id]?.state = model.enabledSemanticLibraries.contains(id)
+                ? .on
+                : .off
+        }
         historyCheckbox.state = model.historyAnalysisEnabled ? .on : .off
         learningCheckbox.state = model.rewriteLearningEnabled ? .on : .off
         helperPathLabel.stringValue = model.helperPath.isEmpty ? "未配置本地 helper" : model.helperPath
@@ -483,6 +551,12 @@ final class SettingsWindowController: NSWindowController {
         model.modelName = modelPicker.indexOfSelectedItem == 1 ? "qwen3.6-flash" : "qwen3.7-plus"
         model.prompt = promptTextView.string
         model.triggerInterval = intervalSlider.doubleValue
+        model.soundEffectsEnabled = soundEffectsCheckbox.state == .on
+        model.enabledSemanticLibraries = Set(
+            SemanticLibraryID.allCases.filter {
+                semanticLibraryCheckboxes[$0]?.state == .on
+            }
+        )
         model.historyAnalysisEnabled = historyCheckbox.state == .on
         model.rewriteLearningEnabled = learningCheckbox.state == .on
         onSave()

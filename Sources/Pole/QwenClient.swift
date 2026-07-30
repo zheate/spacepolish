@@ -191,7 +191,14 @@ enum RewriteResultPolicy {
             throw QwenError.emptyResult
         }
 
-        let resultCore = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawCore = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resultCore = stripModelCommentary(
+            from: rawCore,
+            preservingSourceText: sourceText
+        )
+        guard resultCore.contains(where: { !$0.isWhitespace }) else {
+            throw QwenError.emptyResult
+        }
         guard sourceText.contains(where: { !$0.isWhitespace }) else {
             return resultCore
         }
@@ -201,6 +208,45 @@ enum RewriteResultPolicy {
         return String(leadingWhitespace)
             + resultCore
             + String(trailingWhitespace.reversed())
+    }
+
+    private static func stripModelCommentary(
+        from result: String,
+        preservingSourceText sourceText: String
+    ) -> String {
+        var cleaned = result
+        let leadingLabelPattern = #"^\s*(?:优化后(?:的)?(?:文本|内容)|改写(?:结果|后)?|润色(?:结果|后)?)[ \t]*[:：][ \t]*"#
+        if firstMatch(of: leadingLabelPattern, in: sourceText) == nil,
+           let label = firstMatch(of: leadingLabelPattern, in: cleaned),
+           label.range.location == 0,
+           let range = Range(label.range, in: cleaned) {
+            cleaned.removeSubrange(range)
+            cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let explanationHeadingPattern = #"(?m)^[ \t]*(?:#{1,6}[ \t]*)?(?:\*{1,2})?(?:优化|修改|改写|润色|调整)(?:说明|理由|要点|点)[ \t]*[:：]?(?:\*{1,2})?[ \t]*$"#
+        if firstMatch(of: explanationHeadingPattern, in: sourceText) == nil,
+           let heading = firstMatch(of: explanationHeadingPattern, in: cleaned),
+           heading.range.location > 0,
+           let prefixRange = Range(NSRange(location: 0, length: heading.range.location), in: cleaned) {
+            let prefix = cleaned[prefixRange]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !prefix.isEmpty {
+                cleaned = prefix
+            }
+        }
+        return cleaned
+    }
+
+    private static func firstMatch(
+        of pattern: String,
+        in text: String
+    ) -> NSTextCheckingResult? {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        return regex.firstMatch(
+            in: text,
+            range: NSRange(text.startIndex..<text.endIndex, in: text)
+        )
     }
 }
 

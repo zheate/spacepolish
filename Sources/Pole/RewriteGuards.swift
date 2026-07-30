@@ -51,6 +51,13 @@ struct VoiceAuditResult: Equatable {
     let issues: [String]
 }
 
+struct RewriteAlignmentAuditResult: Equatable {
+    let accepted: Bool
+    let issues: [String]
+    let retainedSourceRatio: Double
+    let introducedOutputRatio: Double
+}
+
 enum RewriteSafetyError: LocalizedError {
     case rejected([String])
 
@@ -83,21 +90,22 @@ enum FactGuard {
     private static let negativeMarkers = ["不", "没", "未", "不能", "无法", "不要", "并非", "否认"]
     private static let uncertainMarkers = ["可能", "也许", "大概", "预计", "应该", "似乎", "风险", "暂时"]
     private static let certainMarkers = ["已经", "确定", "一定", "必然", "确认", "肯定", "完成了"]
-    private static let sequenceMarkerGroups = [
-        ["先", "首先"], ["再", "然后", "随后"], ["之前", "以前"], ["之后", "以后"]
+    private static let sequenceMarkers = [
+        "先", "首先", "再", "然后", "随后", "接着", "之前", "以前", "之后", "以后",
+        "后再", "完再", "完了再"
     ]
     private static let actionMarkerGroups = [
-        ["发送", "发给", "转发"],
-        ["确认", "核实"],
-        ["通知", "告知", "同步"],
-        ["提交", "交付", "提供"],
-        ["修改", "调整", "更新"],
-        ["删除", "移除", "取消"],
-        ["付款", "支付", "打款"],
-        ["安排", "预约", "排期"],
-        ["完成", "做完"],
-        ["拒绝", "不同意"],
-        ["回复", "答复", "反馈"]
+        ["发送", "发给", "转发", "发过去", "发过来", "发一下", "发下"],
+        ["确认", "核实", "查一下", "查下"],
+        ["通知", "告知", "同步", "告诉", "说一声", "说一下", "说下"],
+        ["提交", "交付", "提供", "给到"],
+        ["修改", "调整", "更新", "改一下", "改下", "改成", "改掉"],
+        ["删除", "移除", "取消", "删掉", "删一下", "删下"],
+        ["付款", "支付", "打款", "转账"],
+        ["安排", "预约", "排期", "约一下", "约下"],
+        ["完成", "做完", "弄完", "搞定"],
+        ["拒绝", "不同意", "不接受"],
+        ["回复", "答复", "反馈", "回我", "回你", "回他", "回她", "回一下", "回下"]
     ]
     private static let riskyIntroductions: [(label: String, markers: [String])] = [
         ("时间", ["今天", "明天", "后天", "本周", "下周", "周一", "周二", "周三", "周四", "周五", "月底"]),
@@ -109,11 +117,15 @@ enum FactGuard {
         sourceText: String,
         result: StructuredRewriteResult,
         applicationRole: ApplicationWritingRole,
-        expansionRatio: Double
+        expansionRatio: Double,
+        semanticLibraries: Set<SemanticLibraryID> = SemanticLibraryID.defaultEnabled
     ) -> FactAuditResult {
         let output = result.rewrittenText
         var issues: [String] = []
-        let tokens = protectedTokens(in: sourceText)
+        let tokens = protectedTokens(
+            in: sourceText,
+            semanticLibraries: semanticLibraries
+        )
         for token in tokens where !output.localizedCaseInsensitiveContains(token) {
             issues.append("缺少受保护内容：\(token)")
         }
@@ -145,8 +157,9 @@ enum FactGuard {
             issues.append("输出擅自增加责任人或任务分配")
         }
 
-        for markers in sequenceMarkerGroups
-            where containsAny(markers, in: sourceText) && !containsAny(markers, in: output) {
+        if containsAny(sequenceMarkers, in: sourceText),
+           !containsAny(sequenceMarkers, in: output),
+           isLikelyInformationLoss(sourceText: sourceText, outputText: output) {
             issues.append("输出删除了原文的先后关系")
         }
         for markers in actionMarkerGroups
@@ -181,7 +194,10 @@ enum FactGuard {
         )
     }
 
-    static func protectedTokens(in text: String) -> [String] {
+    static func protectedTokens(
+        in text: String,
+        semanticLibraries: Set<SemanticLibraryID> = SemanticLibraryID.defaultEnabled
+    ) -> [String] {
         var tokens: [String] = []
         for pattern in protectedPatterns {
             guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
@@ -192,11 +208,28 @@ enum FactGuard {
                 if !token.isEmpty, !tokens.contains(token) { tokens.append(token) }
             }
         }
+        for term in SemanticLibraryCatalog.protectedTerms(
+            in: text,
+            enabled: semanticLibraries
+        )
+            where !tokens.contains(where: {
+                $0.caseInsensitiveCompare(term) == .orderedSame
+            }) {
+            tokens.append(term)
+        }
         return tokens
     }
 
     private static func containsAny(_ markers: [String], in text: String) -> Bool {
         markers.contains { text.contains($0) }
+    }
+
+    private static func isLikelyInformationLoss(
+        sourceText: String,
+        outputText: String
+    ) -> Bool {
+        guard !sourceText.isEmpty else { return false }
+        return Double(outputText.count + 4) < Double(sourceText.count) * 0.72
     }
 
     private static func containsResponsibilityAssignment(in text: String) -> Bool {
@@ -239,6 +272,99 @@ enum FactGuard {
             || line.hasPrefix("curl ")
             || line.contains("/") && !line.contains(" ")
             || line.hasPrefix("```")
+    }
+}
+
+enum MessagingRewriteRetryPolicy {
+    static let unchangedIssue = "候选与原文完全相同；请在不改变意思和语气的前提下，至少完成一处真实改善。"
+
+    static func shouldRetryUnchanged(
+        sourceText: String,
+        candidate: String
+    ) -> Bool {
+        let source = normalized(sourceText)
+        let output = normalized(candidate)
+        return source.count >= 6 && source == output
+    }
+
+    private static func normalized(_ text: String) -> String {
+        text.precomposedStringWithCanonicalMapping
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+enum RewriteAlignmentGuard {
+    static func audit(
+        sourceText: String,
+        outputText: String,
+        applicationRole: ApplicationWritingRole
+    ) -> RewriteAlignmentAuditResult {
+        let source = contentCharacters(in: sourceText)
+        let output = contentCharacters(in: outputText)
+        guard source.count >= 12, !output.isEmpty, source != output else {
+            return RewriteAlignmentAuditResult(
+                accepted: true,
+                issues: [],
+                retainedSourceRatio: 1,
+                introducedOutputRatio: 0
+            )
+        }
+
+        let retainedCount = multisetIntersectionCount(source, output)
+        let retainedSourceRatio = Double(retainedCount) / Double(source.count)
+        let introducedOutputRatio = 1 - Double(retainedCount) / Double(output.count)
+        let outputLengthRatio = Double(output.count) / Double(source.count)
+        let minimumRetention = applicationRole == .messaging ? 0.46 : 0.38
+        var issues: [String] = []
+
+        if retainedSourceRatio < minimumRetention,
+           introducedOutputRatio > 0.52 {
+            issues.append("输出与原文的词句对齐度过低，可能存在无依据的大幅改写")
+        }
+        if source.count >= 18,
+           outputLengthRatio < 0.55,
+           retainedSourceRatio < 0.66 {
+            issues.append("输出大幅压缩了原文，可能删除了必要信息")
+        }
+        if outputLengthRatio > 1.85,
+           introducedOutputRatio > 0.42 {
+            issues.append("输出大幅扩写了原文，可能增加了无依据内容")
+        }
+
+        return RewriteAlignmentAuditResult(
+            accepted: issues.isEmpty,
+            issues: Array(issues.prefix(3)),
+            retainedSourceRatio: retainedSourceRatio,
+            introducedOutputRatio: introducedOutputRatio
+        )
+    }
+
+    private static func contentCharacters(in text: String) -> [Character] {
+        text.precomposedStringWithCanonicalMapping
+            .folding(
+                options: [.caseInsensitive, .widthInsensitive],
+                locale: Locale(identifier: "zh_CN")
+            )
+            .filter { character in
+                character.unicodeScalars.contains {
+                    CharacterSet.alphanumerics.contains($0)
+                }
+            }
+    }
+
+    private static func multisetIntersectionCount(
+        _ source: [Character],
+        _ output: [Character]
+    ) -> Int {
+        var remaining = output.reduce(into: [Character: Int]()) { counts, character in
+            counts[character, default: 0] += 1
+        }
+        var retained = 0
+        for character in source where remaining[character, default: 0] > 0 {
+            retained += 1
+            remaining[character, default: 0] -= 1
+        }
+        return retained
     }
 }
 

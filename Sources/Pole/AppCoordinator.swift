@@ -58,7 +58,12 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     private let conversationResolver = ConversationResolver()
     private let monitor = DoubleOptionMonitor()
     private let hud = StatusHUD()
-    private let inputProgressIndicator = InputProgressIndicator()
+    private let rewriteHighlightOverlay = RewriteHighlightOverlay()
+    private lazy var inputProgressIndicator = InputProgressIndicator(
+        isSoundEnabled: { [weak self] in
+            self?.model.soundEffectsEnabled ?? false
+        }
+    )
     private let conversationProfilePanel = ConversationProfilePanel()
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private var settingsController: SettingsWindowController?
@@ -66,6 +71,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     private var pendingCompletion: PendingCompletion?
     private var progressPositionRetryWorkItem: DispatchWorkItem?
     private var recentRewriteFeedbackContext: RecentRewriteFeedbackContext?
+    private var rewriteHighlightGeneration = 0
     private var activePerformanceTrace: RewritePerformanceTrace?
 
     override init() {
@@ -484,6 +490,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             action: .polish,
             prompt: polishPrompt(
                 for: snapshot,
+                sourceText: context.sourceText,
                 conversationInstruction: policy.modelInstruction
             ),
             conversationSnapshot: snapshot,
@@ -494,17 +501,29 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
 
     private func polishPrompt(
         for snapshot: ConversationSnapshot?,
+        sourceText: String,
         conversationInstruction: String? = nil
     ) -> String {
-        let contextInstruction = snapshot.flatMap {
+        let applicationInstruction = snapshot.flatMap {
             ApplicationContextPolicy.contextInstruction(
                 for: $0.applicationContext,
                 conversationInstruction: conversationInstruction
             )
         }
+        let semanticInstruction = SemanticLibraryCatalog.modelInstruction(
+            for: sourceText,
+            enabled: model.enabledSemanticLibraries
+        )
+        let contextInstruction = [applicationInstruction, semanticInstruction]
+            .compactMap { instruction -> String? in
+                guard let instruction else { return nil }
+                let trimmed = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            }
+            .joined(separator: "\n")
         return PromptPolicy.polishPrompt(
             basePrompt: model.prompt,
-            contextInstruction: contextInstruction
+            contextInstruction: contextInstruction.isEmpty ? nil : contextInstruction
         )
     }
 
@@ -582,6 +601,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         communicationContext: CommunicationContext?,
         progressAlreadyShown: Bool = false
     ) {
+        rewriteHighlightGeneration &+= 1
+        rewriteHighlightOverlay.hide()
         model.isProcessing = true
         model.statusText = action.promptDescription
         if !progressAlreadyShown {
@@ -600,8 +621,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             do {
                 let result: String
                 if action == .polish,
-                   let communicationContext,
-                   communicationContext.applicationContext.role == .messaging {
+                   let communicationContext {
                     let first = StructuredRewriteResult(
                         rewrittenText: try await self.requestOptimization(
                             text: context.sourceText,
@@ -617,7 +637,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         sourceText: context.sourceText,
                         result: first,
                         applicationRole: communicationContext.applicationContext.role,
-                        expansionRatio: communicationContext.policy.messageExpansionRatio
+                        expansionRatio: communicationContext.policy.messageExpansionRatio,
+                        semanticLibraries: self.model.enabledSemanticLibraries
                     )
                     let firstVoiceAudit = VoiceGuard.audit(
                         sourceText: context.sourceText,
@@ -625,15 +646,33 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         expectedVoice: communicationContext.policy.voice,
                         applicationRole: communicationContext.applicationContext.role
                     )
+                    let firstAlignmentAudit = RewriteAlignmentGuard.audit(
+                        sourceText: context.sourceText,
+                        outputText: first.rewrittenText,
+                        applicationRole: communicationContext.applicationContext.role
+                    )
                     self.activePerformanceTrace?.record(
                         .firstGuard,
                         since: firstGuardStartedAt
                     )
-                    if firstFactAudit.accepted, firstVoiceAudit.accepted {
+                    let firstWasSafe = firstFactAudit.accepted
+                        && firstVoiceAudit.accepted
+                        && firstAlignmentAudit.accepted
+                    let shouldRetryUnchanged = communicationContext.applicationContext.role == .messaging
+                        && MessagingRewriteRetryPolicy.shouldRetryUnchanged(
+                            sourceText: context.sourceText,
+                            candidate: first.rewrittenText
+                        )
+                    if firstWasSafe, !shouldRetryUnchanged {
                         result = first.rewrittenText
                     } else {
                         attemptState.retried = true
-                        let issues = firstFactAudit.issues + firstVoiceAudit.issues
+                        var issues = firstFactAudit.issues
+                            + firstVoiceAudit.issues
+                            + firstAlignmentAudit.issues
+                        if shouldRetryUnchanged {
+                            issues.append(MessagingRewriteRetryPolicy.unchangedIssue)
+                        }
                         let retry = StructuredRewriteResult(
                             rewrittenText: try await self.requestOptimization(
                                 text: context.sourceText,
@@ -649,7 +688,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                             sourceText: context.sourceText,
                             result: retry,
                             applicationRole: communicationContext.applicationContext.role,
-                            expansionRatio: communicationContext.policy.messageExpansionRatio
+                            expansionRatio: communicationContext.policy.messageExpansionRatio,
+                            semanticLibraries: self.model.enabledSemanticLibraries
                         )
                         let retryVoiceAudit = VoiceGuard.audit(
                             sourceText: context.sourceText,
@@ -657,15 +697,28 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                             expectedVoice: communicationContext.policy.voice,
                             applicationRole: communicationContext.applicationContext.role
                         )
+                        let retryAlignmentAudit = RewriteAlignmentGuard.audit(
+                            sourceText: context.sourceText,
+                            outputText: retry.rewrittenText,
+                            applicationRole: communicationContext.applicationContext.role
+                        )
                         self.activePerformanceTrace?.record(
                             .retryGuard,
                             since: retryGuardStartedAt
                         )
-                        if retryFactAudit.accepted, retryVoiceAudit.accepted {
+                        if retryFactAudit.accepted,
+                           retryVoiceAudit.accepted,
+                           retryAlignmentAudit.accepted {
                             result = retry.rewrittenText
+                        } else if firstWasSafe {
+                            // An unchanged first result is still safer than a retry
+                            // that introduced a fact or voice regression.
+                            result = first.rewrittenText
                         } else {
                             throw RewriteSafetyError.rejected(
-                                retryFactAudit.issues + retryVoiceAudit.issues
+                                retryFactAudit.issues
+                                    + retryVoiceAudit.issues
+                                    + retryAlignmentAudit.issues
                             )
                         }
                     }
@@ -679,6 +732,12 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         stage: .firstModel
                     )
                 }
+                let highlightPlan = action == .polish
+                    ? RewriteHighlightPlanner.plan(
+                        sourceText: context.sourceText,
+                        outputText: result
+                    )
+                    : RewriteHighlightPlan(ranges: [])
                 try await MainActor.run {
                     let writebackStartedAt = RewritePerformanceTrace.timestamp()
                     if let conversationSnapshot,
@@ -690,6 +749,15 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         result: result
                     )
                     try self.textService.replace(context: context, with: result)
+                    if highlightPlan.hasChanges {
+                        self.scheduleRewriteHighlights(
+                            plan: highlightPlan,
+                            context: context,
+                            finalCursorUTF16: context.replacementRange.location
+                                + (result as NSString).length,
+                            generation: self.rewriteHighlightGeneration
+                        )
+                    }
                     if action == .polish {
                         let relationshipID = communicationContext?.relationship?.id
                         let historyEntryID: UUID?
@@ -787,6 +855,71 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             operation: operation,
             remainingDelays: [0.04, 0.12, 0.24]
         )
+    }
+
+    private func scheduleRewriteHighlights(
+        plan: RewriteHighlightPlan,
+        context: CapturedTextContext,
+        finalCursorUTF16: Int,
+        generation: Int
+    ) {
+        let absoluteRanges = plan.ranges.map { range in
+            NSRange(
+                location: context.replacementRange.location + range.location,
+                length: range.length
+            )
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self] in
+            self?.attemptToShowRewriteHighlights(
+                ranges: absoluteRanges,
+                changeCount: plan.changeCount,
+                context: context,
+                finalCursorUTF16: finalCursorUTF16,
+                generation: generation,
+                remainingDelays: [0.20, 0.36]
+            )
+        }
+    }
+
+    private func attemptToShowRewriteHighlights(
+        ranges: [NSRange],
+        changeCount: Int,
+        context: CapturedTextContext,
+        finalCursorUTF16: Int,
+        generation: Int,
+        remainingDelays: [TimeInterval]
+    ) {
+        guard rewriteHighlightGeneration == generation,
+              textService.isTargetApplicationFrontmost(for: context) else {
+            return
+        }
+
+        let rects = textService.highlightScreenRects(for: ranges, in: context)
+        if !rects.isEmpty {
+            rewriteHighlightOverlay.show(accessibilityScreenRects: rects)
+            return
+        }
+
+        guard let delay = remainingDelays.first else {
+            rewriteHighlightOverlay.showFallback(
+                at: textService.insertionPointScreenRect(
+                    for: context,
+                    cursorUTF16: finalCursorUTF16
+                ),
+                changeCount: changeCount
+            )
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.attemptToShowRewriteHighlights(
+                ranges: ranges,
+                changeCount: changeCount,
+                context: context,
+                finalCursorUTF16: finalCursorUTF16,
+                generation: generation,
+                remainingDelays: Array(remainingDelays.dropFirst())
+            )
+        }
     }
 
     private func attemptToShowInputProgress(

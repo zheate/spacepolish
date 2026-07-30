@@ -11,6 +11,8 @@ final class AppModel: ObservableObject {
     @Published var modelName: String
     @Published var prompt: String
     @Published var triggerInterval: Double
+    @Published var soundEffectsEnabled: Bool
+    @Published var enabledSemanticLibraries: Set<SemanticLibraryID>
     @Published var historyAnalysisEnabled: Bool
     @Published var rewriteLearningEnabled: Bool
     @Published var helperPath: String
@@ -38,6 +40,8 @@ final class AppModel: ObservableObject {
 
         let savedInterval = defaults.double(forKey: "triggerInterval")
         self.triggerInterval = savedInterval > 0 ? savedInterval : 1.2
+        self.soundEffectsEnabled = defaults.object(forKey: "soundEffectsEnabled") as? Bool ?? true
+        self.enabledSemanticLibraries = SemanticLibraryPreferences.load(from: defaults)
         self.historyAnalysisEnabled = defaults.bool(forKey: "historyAnalysisEnabled")
         self.rewriteLearningEnabled = defaults.bool(forKey: "rewriteLearningEnabled")
         self.helperPath = Self.resolveHelperURL(from: defaults)?.path ?? ""
@@ -61,6 +65,8 @@ final class AppModel: ObservableObject {
         defaults.set(modelName, forKey: "modelName")
         defaults.set(prompt, forKey: "prompt")
         defaults.set(triggerInterval, forKey: "triggerInterval")
+        defaults.set(soundEffectsEnabled, forKey: "soundEffectsEnabled")
+        SemanticLibraryPreferences.save(enabledSemanticLibraries, to: defaults)
         defaults.set(historyAnalysisEnabled, forKey: "historyAnalysisEnabled")
         defaults.set(rewriteLearningEnabled, forKey: "rewriteLearningEnabled")
         defaults.removeObject(forKey: "conversationHelperPath")

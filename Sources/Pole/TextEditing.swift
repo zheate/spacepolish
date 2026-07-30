@@ -192,17 +192,43 @@ enum KeyboardTextCommitPlanner {
 }
 
 enum KeyboardFallbackPolicy {
+    // 终端应用按用户要求允许键盘回退；写回依赖模拟粘贴，多行文本会被终端当作命令执行，风险由用户承担。
     private static let excludedBundleIdentifiers: Set<String> = [
-        "com.spacepolish.mac",
-        "com.apple.Terminal",
-        "com.googlecode.iterm2",
-        "dev.warp.Warp-Stable",
-        "org.alacritty",
-        "com.mitchellh.ghostty"
+        "com.spacepolish.mac"
+    ]
+
+    private static let customEditorBundleIdentifiers: Set<String> = [
+        "com.tencent.xinwechat",
+        "com.tencent.weworkmac"
     ]
 
     static func allows(bundleIdentifier: String) -> Bool {
-        !excludedBundleIdentifiers.contains(bundleIdentifier)
+        !excludedBundleIdentifiers.contains(bundleIdentifier.lowercased())
+    }
+
+    static func shouldRetryCapture(
+        after error: TextEditingError,
+        bundleIdentifier: String
+    ) -> Bool {
+        guard allows(bundleIdentifier: bundleIdentifier) else { return false }
+        switch error {
+        case .noFocusedTextField, .unsupportedTextField:
+            return true
+        case .cursorUnavailable, .noTextToOptimize, .selectionUnavailable:
+            return customEditorBundleIdentifiers.contains(bundleIdentifier.lowercased())
+        default:
+            return false
+        }
+    }
+
+    static func shouldRetryWriteback(
+        after error: TextEditingError,
+        bundleIdentifier: String
+    ) -> Bool {
+        guard customEditorBundleIdentifiers.contains(bundleIdentifier.lowercased()) else {
+            return false
+        }
+        return error == .readOnlyTextField || error == .cannotSetSelection
     }
 }
 
@@ -366,6 +392,49 @@ private enum AccessibilityCaretLocator {
         )
     }
 
+    static func screenRects(
+        on element: AXUIElement,
+        ranges: [NSRange]
+    ) -> [CGRect] {
+        ranges.compactMap { range in
+            guard range.location >= 0, range.length >= 0 else { return nil }
+            if range.length == 0 {
+                return screenRect(at: range.location, on: element)
+            }
+            return bounds(
+                for: CFRange(location: range.location, length: range.length),
+                on: element
+            )
+        }
+    }
+
+    static func focusedScreenRects(
+        processIdentifier: pid_t,
+        ranges: [NSRange]
+    ) -> [CGRect] {
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            systemWide,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedRef
+        ) == .success,
+              let focusedRef else {
+            return []
+        }
+
+        let focusedElement = focusedRef as! AXUIElement
+        var focusedProcessIdentifier: pid_t = 0
+        guard AXUIElementGetPid(
+            focusedElement,
+            &focusedProcessIdentifier
+        ) == .success,
+              focusedProcessIdentifier == processIdentifier else {
+            return []
+        }
+        return screenRects(on: focusedElement, ranges: ranges)
+    }
+
     private static func selectedTextRange(on element: AXUIElement) -> CFRange? {
         var rangeRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(
@@ -487,9 +556,11 @@ struct AccessibilityTextService {
         do {
             return try captureUsingAccessibility()
         } catch let error as TextEditingError {
-            let canRetryWithKeyboard = error == .noFocusedTextField
-                || error == .unsupportedTextField
-            guard canRetryWithKeyboard,
+            guard let bundleIdentifier = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+                  KeyboardFallbackPolicy.shouldRetryCapture(
+                    after: error,
+                    bundleIdentifier: bundleIdentifier
+                  ),
                   KeyboardTextFallback.supportsFrontmostApplication else {
                 throw error
             }
@@ -564,11 +635,31 @@ struct AccessibilityTextService {
     func replace(context: CapturedTextContext, with replacement: String) throws {
         switch context.target {
         case .accessibility(let element):
-            try replaceUsingAccessibility(
-                element: element,
-                context: context,
-                replacement: replacement
-            )
+            do {
+                try replaceUsingAccessibility(
+                    element: element,
+                    context: context,
+                    replacement: replacement
+                )
+            } catch let error as TextEditingError {
+                var processIdentifier: pid_t = 0
+                guard AXUIElementGetPid(element, &processIdentifier) == .success,
+                      NSWorkspace.shared.frontmostApplication?.processIdentifier == processIdentifier,
+                      let bundleIdentifier = NSRunningApplication(
+                        processIdentifier: processIdentifier
+                      )?.bundleIdentifier,
+                      KeyboardFallbackPolicy.shouldRetryWriteback(
+                        after: error,
+                        bundleIdentifier: bundleIdentifier
+                      ) else {
+                    throw error
+                }
+                try KeyboardTextFallback.replace(
+                    context: context,
+                    with: replacement,
+                    processIdentifier: processIdentifier
+                )
+            }
         case .keyboard(let processIdentifier):
             try KeyboardTextFallback.replace(
                 context: context,
@@ -665,6 +756,55 @@ struct AccessibilityTextService {
                 preferredLocation: cursorUTF16,
                 fallbackLocation: context.cursorUTF16
             )
+        }
+    }
+
+    func highlightScreenRects(
+        for ranges: [NSRange],
+        in context: CapturedTextContext
+    ) -> [CGRect] {
+        guard !ranges.isEmpty,
+              isTargetApplicationFrontmost(for: context) else {
+            return []
+        }
+
+        switch context.target {
+        case .accessibility(let element):
+            let direct = AccessibilityCaretLocator.screenRects(
+                on: element,
+                ranges: ranges
+            )
+            if !direct.isEmpty { return direct }
+
+            var processIdentifier: pid_t = 0
+            guard AXUIElementGetPid(element, &processIdentifier) == .success else {
+                return []
+            }
+            return AccessibilityCaretLocator.focusedScreenRects(
+                processIdentifier: processIdentifier,
+                ranges: ranges
+            )
+        case .keyboard(let processIdentifier):
+            return AccessibilityCaretLocator.focusedScreenRects(
+                processIdentifier: processIdentifier,
+                ranges: ranges
+            )
+        }
+    }
+
+    func isTargetApplicationFrontmost(for context: CapturedTextContext) -> Bool {
+        guard let frontmostProcessIdentifier = NSWorkspace.shared
+            .frontmostApplication?
+            .processIdentifier else {
+            return false
+        }
+        switch context.target {
+        case .accessibility(let element):
+            var processIdentifier: pid_t = 0
+            return AXUIElementGetPid(element, &processIdentifier) == .success
+                && processIdentifier == frontmostProcessIdentifier
+        case .keyboard(let processIdentifier):
+            return processIdentifier == frontmostProcessIdentifier
         }
     }
 

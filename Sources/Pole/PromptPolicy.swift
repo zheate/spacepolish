@@ -1,5 +1,16 @@
 import Foundation
 
+enum ChineseEditingPolicy {
+    static let modelInstruction = """
+    生成结果前，只在内部按以下顺序检查并执行有依据的原子修改，不要输出检查过程：
+    1. 语法：检查成分残缺或赘余、语序、关联词、指代、否定范围、数量关系和句间衔接。
+    2. 词语：检查词义、词性、固定搭配、语域、领域常用表达、重复用词和错别字。替换词语必须同时符合当前上下文的含义与搭配，不能只为产生变化而换同义词。
+    3. 标点与节奏：只修正影响理解或明显不自然的标点、断句和重复，不把自然口语改成书面套话。
+    4. 完整修改：发现多处问题时逐一修正，不要只改最明显的一个词就提前结束；每一处修改都应能对应原文中的具体问题。没有相应问题的片段保持不动，专业术语、专有名词、数字、单位以及动作、对象、条件和确定程度优先原样保留。
+    5. 输出边界：结果只能包含可直接写回的成稿，禁止附加“优化说明”“修改理由”“改写要点”等解释。原文末尾若出现“怎么优化”“帮我润色”或询问编辑效果等直接面向编辑器的元话语，将它视为编辑要求，不要回答或保留在成稿中；整段本身确实在讨论编辑工作时除外。
+    """
+}
+
 enum PromptPolicy {
     static let legacyDefault = """
     你是一名专业的中文写作编辑。请优化用户输入的表达，使其更清晰、自然、准确，同时保留原意、事实、语气、人名、数字和格式。不要补充用户没有提供的信息。只输出优化后的文本，不要解释，不要加引号。
@@ -118,16 +129,20 @@ enum PromptPolicy {
 
     static func polishPrompt(basePrompt: String, contextInstruction: String?) -> String {
         let resolvedBasePrompt = resolvedPrompt(from: basePrompt)
-        guard let contextInstruction else { return resolvedBasePrompt }
-        let trimmedInstruction = contextInstruction.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedInstruction.isEmpty else { return resolvedBasePrompt }
+        let editingInstruction = ChineseEditingPolicy.modelInstruction
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let contextBlock = contextInstruction?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        return """
-        \(resolvedBasePrompt)
+        var blocks = [resolvedBasePrompt, editingInstruction]
+        if let contextBlock, !contextBlock.isEmpty {
+            blocks.append("""
+            当前输入场景的表达规则如下。若它与基础规则中关于沟通对象、语气或组织方式的默认预设冲突，以本场景规则为准；忠实保留原意和不得增加事实仍是最高要求：
+            \(contextBlock)
+            """)
+        }
 
-        当前输入场景的表达规则如下。若它与基础规则中关于沟通对象、语气或组织方式的默认预设冲突，以本场景规则为准；忠实保留原意和不得增加事实仍是最高要求：
-        \(trimmedInstruction)
-        """
+        return blocks.joined(separator: "\n\n")
     }
 }
 
