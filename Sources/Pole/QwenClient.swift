@@ -192,9 +192,13 @@ enum RewriteResultPolicy {
         }
 
         let rawCore = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        let resultCore = stripModelCommentary(
+        let resultWithoutCommentary = stripModelCommentary(
             from: rawCore,
             preservingSourceText: sourceText
+        )
+        let resultCore = stripTrailingEditorInstruction(
+            from: resultWithoutCommentary,
+            whenRequestedBy: sourceText
         )
         guard resultCore.contains(where: { !$0.isWhitespace }) else {
             throw QwenError.emptyResult
@@ -233,6 +237,47 @@ enum RewriteResultPolicy {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if !prefix.isEmpty {
                 cleaned = prefix
+            }
+        }
+        return cleaned
+    }
+
+    private static func stripTrailingEditorInstruction(
+        from result: String,
+        whenRequestedBy sourceText: String
+    ) -> String {
+        let pattern = #"(?:怎么优化|帮我润色|优化一下|润色一下|帮我修改|修改一下)[？?。!！\s]*$"#
+        guard !sourceText.contains("讨论"),
+              let sourceMatch = firstMatch(of: pattern, in: sourceText),
+              sourceMatch.range.location > 0,
+              let resultMatch = firstMatch(of: pattern, in: result),
+              resultMatch.range.location > 0,
+              let resultPrefixRange = Range(
+                  NSRange(location: 0, length: resultMatch.range.location),
+                  in: result
+              ) else {
+            return result
+        }
+
+        var cleaned = String(result[resultPrefixRange])
+            .trimmingCharacters(
+                in: .whitespacesAndNewlines.union(
+                    CharacterSet(charactersIn: "，,；;：:")
+                )
+            )
+        guard !cleaned.isEmpty else { return result }
+
+        if let sourcePrefixRange = Range(
+            NSRange(location: 0, length: sourceMatch.range.location),
+            in: sourceText
+        ) {
+            let sourcePrefix = sourceText[sourcePrefixRange]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let terminalCharacters = CharacterSet(charactersIn: "。！？!?")
+            if let terminal = sourcePrefix.unicodeScalars.last,
+               terminalCharacters.contains(terminal),
+               cleaned.unicodeScalars.last.map({ !terminalCharacters.contains($0) }) ?? false {
+                cleaned.unicodeScalars.append(terminal)
             }
         }
         return cleaned

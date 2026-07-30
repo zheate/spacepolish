@@ -721,7 +721,7 @@ struct AccessibilityTextService {
             finalCursor: commit.cursorUTF16
         )
         scheduleCaretRecovery(
-            on: element,
+            processIdentifier: processIdentifier(of: element),
             expectedValue: commit.updatedText,
             cursor: commit.cursorUTF16
         )
@@ -853,92 +853,23 @@ struct AccessibilityTextService {
     }
 
     private func scheduleCaretRecovery(
-        on element: AXUIElement,
+        processIdentifier: pid_t?,
         expectedValue: String,
         cursor: Int
     ) {
-        guard cursor > 0 else { return }
-        var targetProcessIdentifier: pid_t = 0
-        guard AXUIElementGetPid(element, &targetProcessIdentifier) == .success else { return }
+        guard let processIdentifier else { return }
+        scheduleFocusedCaretRecovery(
+            processIdentifier: processIdentifier,
+            expectedValue: expectedValue,
+            cursor: cursor
+        )
+    }
 
-        let state = CaretRecoveryState()
-        for delay in [0.04, 0.14, 0.35, 0.70] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                guard !state.isFinished else { return }
-
-                var focusedRef: CFTypeRef?
-                let systemWide = AXUIElementCreateSystemWide()
-                guard AXUIElementCopyAttributeValue(
-                    systemWide,
-                    kAXFocusedUIElementAttribute as CFString,
-                    &focusedRef
-                ) == .success,
-                      let focusedRef else {
-                    return
-                }
-                let focusedElement = focusedRef as! AXUIElement
-
-                // Electron may recreate its accessibility node after replacing text.
-                // Match the newly focused node by process and value instead of requiring
-                // it to be the exact stale AXUIElement captured before the replacement.
-                var focusedProcessIdentifier: pid_t = 0
-                guard AXUIElementGetPid(
-                    focusedElement,
-                    &focusedProcessIdentifier
-                ) == .success,
-                      focusedProcessIdentifier == targetProcessIdentifier else {
-                    state.isFinished = true
-                    return
-                }
-
-                var valueRef: CFTypeRef?
-                guard AXUIElementCopyAttributeValue(
-                    focusedElement,
-                    kAXValueAttribute as CFString,
-                    &valueRef
-                ) == .success,
-                      valueRef as? String == expectedValue else {
-                    state.isFinished = true
-                    return
-                }
-
-                var rangeRef: CFTypeRef?
-                guard AXUIElementCopyAttributeValue(
-                    focusedElement,
-                    kAXSelectedTextRangeAttribute as CFString,
-                    &rangeRef
-                ) == .success,
-                      let rangeRef,
-                      CFGetTypeID(rangeRef) == AXValueGetTypeID() else {
-                    return
-                }
-                let rangeValue = rangeRef as! AXValue
-
-                var currentRange = CFRange()
-                guard AXValueGetValue(rangeValue, .cfRange, &currentRange) else {
-                    return
-                }
-                if currentRange.location == cursor, currentRange.length == 0 {
-                    state.isFinished = true
-                    return
-                }
-
-                var desiredRange = CFRange(location: cursor, length: 0)
-                guard let desiredValue = AXValueCreate(.cfRange, &desiredRange) else { return }
-                _ = AXUIElementSetAttributeValue(
-                    focusedElement,
-                    kAXSelectedTextRangeAttribute as CFString,
-                    desiredValue
-                )
-
-                // Chromium-based editors can acknowledge AX selection updates but
-                // still keep the DOM selection. A real right-arrow event collapses
-                // that remaining selection without changing the text.
-                if currentRange.length > 0 {
-                    _ = postRightArrowKey()
-                }
-            }
-        }
+    private func processIdentifier(of element: AXUIElement) -> pid_t? {
+        var processIdentifier: pid_t = 0
+        return AXUIElementGetPid(element, &processIdentifier) == .success
+            ? processIdentifier
+            : nil
     }
 
     private func setSelection(on element: AXUIElement, range: CFRange) throws {
@@ -956,6 +887,130 @@ struct AccessibilityTextService {
 
 private final class CaretRecoveryState {
     var isFinished = false
+}
+
+enum CaretRecoveryAction: Equatable {
+    case keepMonitoring
+    case repairSelection
+    case stop
+}
+
+struct CaretRecoveryPolicy {
+    static let checkpoints: [(delay: TimeInterval, isFinal: Bool)] = [
+        (0.04, false),
+        (0.14, false),
+        (0.35, false),
+        (0.70, false),
+        (1.10, false),
+        (1.35, true)
+    ]
+
+    static func action(
+        currentRange: CFRange,
+        expectedCursor: Int,
+        isFinalCheckpoint: Bool
+    ) -> CaretRecoveryAction {
+        if currentRange.location == expectedCursor, currentRange.length == 0 {
+            return isFinalCheckpoint ? .stop : .keepMonitoring
+        }
+        if currentRange.location == 0 || currentRange.length > 0 {
+            return .repairSelection
+        }
+        return .stop
+    }
+}
+
+private func scheduleFocusedCaretRecovery(
+    processIdentifier targetProcessIdentifier: pid_t,
+    expectedValue: String,
+    cursor: Int
+) {
+    guard cursor > 0 else { return }
+
+    let state = CaretRecoveryState()
+    for checkpoint in CaretRecoveryPolicy.checkpoints {
+        DispatchQueue.main.asyncAfter(deadline: .now() + checkpoint.delay) {
+            guard !state.isFinished else { return }
+
+            var focusedRef: CFTypeRef?
+            let systemWide = AXUIElementCreateSystemWide()
+            guard AXUIElementCopyAttributeValue(
+                systemWide,
+                kAXFocusedUIElementAttribute as CFString,
+                &focusedRef
+            ) == .success,
+                  let focusedRef else {
+                return
+            }
+            let focusedElement = focusedRef as! AXUIElement
+
+            // Electron may recreate its accessibility node after replacing text.
+            // Match the new node by process and current value rather than retaining
+            // the stale element captured before the writeback.
+            var focusedProcessIdentifier: pid_t = 0
+            guard AXUIElementGetPid(
+                focusedElement,
+                &focusedProcessIdentifier
+            ) == .success,
+                  focusedProcessIdentifier == targetProcessIdentifier else {
+                state.isFinished = true
+                return
+            }
+
+            var valueRef: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(
+                focusedElement,
+                kAXValueAttribute as CFString,
+                &valueRef
+            ) == .success,
+                  valueRef as? String == expectedValue else {
+                state.isFinished = true
+                return
+            }
+
+            var rangeRef: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(
+                focusedElement,
+                kAXSelectedTextRangeAttribute as CFString,
+                &rangeRef
+            ) == .success,
+                  let rangeRef,
+                  CFGetTypeID(rangeRef) == AXValueGetTypeID() else {
+                return
+            }
+            let rangeValue = rangeRef as! AXValue
+            var currentRange = CFRange()
+            guard AXValueGetValue(rangeValue, .cfRange, &currentRange) else {
+                return
+            }
+
+            let action = CaretRecoveryPolicy.action(
+                currentRange: currentRange,
+                expectedCursor: cursor,
+                isFinalCheckpoint: checkpoint.isFinal
+            )
+            if action == .keepMonitoring { return }
+            if action == .stop {
+                state.isFinished = true
+                return
+            }
+
+            var desiredRange = CFRange(location: cursor, length: 0)
+            guard let desiredValue = AXValueCreate(.cfRange, &desiredRange) else { return }
+            _ = AXUIElementSetAttributeValue(
+                focusedElement,
+                kAXSelectedTextRangeAttribute as CFString,
+                desiredValue
+            )
+
+            // Chromium-based editors can acknowledge AX selection updates but keep
+            // a DOM selection. A right-arrow collapses that selection at its end.
+            if currentRange.length > 0 {
+                _ = postRightArrowKey()
+            }
+            if checkpoint.isFinal { state.isFinished = true }
+        }
+    }
 }
 
 @discardableResult
@@ -1196,6 +1251,11 @@ private enum KeyboardTextFallback {
             replacement: replacement
         )
         try pasteAllText(commit.updatedText, processIdentifier: processIdentifier)
+        scheduleFocusedCaretRecovery(
+            processIdentifier: processIdentifier,
+            expectedValue: commit.updatedText,
+            cursor: commit.cursorUTF16
+        )
     }
 
     private static func readAllText(processIdentifier: pid_t) throws -> String {

@@ -55,7 +55,11 @@ final class RewritePerformanceTrace: @unchecked Sendable {
         )
     }
 
-    func finish(outcome: String, retried: Bool) {
+    func finish(
+        outcome: String,
+        retried: Bool,
+        retryReason: String? = nil
+    ) {
         lock.lock()
         guard !isFinished else {
             lock.unlock()
@@ -66,8 +70,9 @@ final class RewritePerformanceTrace: @unchecked Sendable {
         lock.unlock()
 
         let total = Self.milliseconds(since: startedAt)
+        let resolvedRetryReason = retryReason ?? "none"
         Self.logger.info(
-            "action=\(self.action, privacy: .public) stage=total duration_ms=\(total, privacy: .public) input_chars=\(length, privacy: .public) retried=\(retried, privacy: .public) outcome=\(outcome, privacy: .public)"
+            "action=\(self.action, privacy: .public) stage=total duration_ms=\(total, privacy: .public) input_chars=\(length, privacy: .public) retried=\(retried, privacy: .public) retry_reason=\(resolvedRetryReason, privacy: .public) outcome=\(outcome, privacy: .public)"
         )
     }
 

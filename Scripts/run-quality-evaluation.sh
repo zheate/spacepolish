@@ -3,7 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
 PROJECT_DIR="${SCRIPT_DIR:h}"
-CHECK_BINARY="$(mktemp -d)/pole-checks"
+EVALUATION_DIR="$(mktemp -d)"
+EVALUATION_BINARY="$EVALUATION_DIR/pole-quality-evaluation"
 
 cd "$PROJECT_DIR"
 swiftc \
@@ -12,7 +13,6 @@ swiftc \
     -framework ApplicationServices \
     -framework Vision \
     -framework Security \
-    Sources/Pole/DoubleOptionMonitor.swift \
     Sources/Pole/QwenClient.swift \
     Sources/Pole/KeychainStore.swift \
     Sources/Pole/ApplicationContext.swift \
@@ -21,11 +21,9 @@ swiftc \
     Sources/Pole/CommunicationIntelligence.swift \
     Sources/Pole/ExternalConversationHelper.swift \
     Sources/Pole/RewriteGuards.swift \
-    Sources/Pole/RewriteHighlightOverlay.swift \
-    Sources/Pole/InputProgressIndicator.swift \
     Sources/Pole/ConversationContext.swift \
-    Sources/Pole/TextEditing.swift \
     Checks/RewriteQualityCorpus.swift \
-    Checks/main.swift \
-    -o "$CHECK_BINARY"
-"$CHECK_BINARY"
+    Checks/QualityEvaluationMain.swift \
+    -o "$EVALUATION_BINARY"
+
+"$EVALUATION_BINARY" "${1:-40}"

@@ -323,6 +323,51 @@ do {
     print("FAIL  无选区光标定位抛出异常：\(error)")
 }
 
+check(
+    CaretRecoveryPolicy.action(
+        currentRange: CFRange(location: 12, length: 0),
+        expectedCursor: 12,
+        isFinalCheckpoint: false
+    ) == .keepMonitoring,
+    "光标首次正确后仍继续观察稳定窗口"
+)
+check(
+    CaretRecoveryPolicy.action(
+        currentRange: CFRange(location: 12, length: 0),
+        expectedCursor: 12,
+        isFinalCheckpoint: true
+    ) == .stop,
+    "稳定窗口最后一次确认正确后才结束恢复"
+)
+check(
+    CaretRecoveryPolicy.action(
+        currentRange: CFRange(location: 0, length: 0),
+        expectedCursor: 12,
+        isFinalCheckpoint: false
+    ) == .repairSelection,
+    "Electron 延迟把光标重置到开头时会再次修复"
+)
+check(
+    CaretRecoveryPolicy.action(
+        currentRange: CFRange(location: 0, length: 12),
+        expectedCursor: 12,
+        isFinalCheckpoint: false
+    ) == .repairSelection,
+    "自定义输入框残留选区时会折叠到结果末尾"
+)
+check(
+    CaretRecoveryPolicy.action(
+        currentRange: CFRange(location: 5, length: 0),
+        expectedCursor: 12,
+        isFinalCheckpoint: false
+    ) == .stop,
+    "用户主动移动到其他位置时停止光标恢复"
+)
+check(
+    CaretRecoveryPolicy.checkpoints.last?.delay ?? 0 >= 1.3,
+    "光标恢复覆盖 Electron 的延迟重置窗口"
+)
+
 do {
     let input = "开头保持，只优化这里，结尾保持"
     let expected = (input as NSString).range(of: "只优化这里")
@@ -515,24 +560,22 @@ let chineseEditingPrompt = PromptPolicy.polishPrompt(
     contextInstruction: "聊天规则"
 )
 check(
-    chineseEditingPrompt.contains("成分残缺或赘余")
-        && chineseEditingPrompt.contains("词义、词性、固定搭配、语域、领域常用表达")
-        && chineseEditingPrompt.contains("发现多处问题时逐一修正")
-        && chineseEditingPrompt.contains("禁止附加“优化说明”")
+    chineseEditingPrompt.contains("语法、搭配、语序、指代、重复")
+        && chineseEditingPrompt.contains("对每个真实问题分别做最小且有效的修改")
+        && chineseEditingPrompt.contains("人物、动作、对象、条件、先后关系")
+        && chineseEditingPrompt.contains("只作为编辑指令，不写入成稿")
         && chineseEditingPrompt.contains("聊天规则"),
     "润色请求包含中文语法、词语搭配和原文对齐规则"
 )
 check(
-    PromptPolicy.currentDefault.contains("保持原文的确定程度")
-        && PromptPolicy.currentDefault.contains("避免公文腔、模板腔")
-        && PromptPolicy.currentDefault.contains("保留口语中自然省略的成分")
+    PromptPolicy.currentDefault.contains("结论和确定程度")
+        && PromptPolicy.currentDefault.contains("不是邮件、工作汇报、会议纪要、客服话术")
+        && PromptPolicy.currentDefault.contains("保持原文的亲疏程度、直接程度和自然省略")
         && PromptPolicy.currentDefault.contains("讨论了下")
-        && PromptPolicy.currentDefault.contains("动作及其对象、受益人、目的和先后关系")
-        && PromptPolicy.currentDefault.contains("简洁不是越短越好")
-        && PromptPolicy.currentDefault.contains("不要为了显得精炼而删减信息")
-        && PromptPolicy.currentDefault.contains("默认应给出经过优化的版本")
-        && PromptPolicy.currentDefault.contains("必须至少完成一处")
-        && PromptPolicy.currentDefault.contains("才原样返回")
+        && PromptPolicy.currentDefault.contains("BOM 里局部镀")
+        && PromptPolicy.currentDefault.contains("发现多个问题时全部处理")
+        && PromptPolicy.currentDefault.contains("有明确改进空间时必须给出真正改善后的版本")
+        && PromptPolicy.currentDefault.contains("才可以原样返回")
         && !PromptPolicy.currentDefault.contains("优先原样输出"),
     "新版提示词兼顾信息保留和主动有效修改"
 )
@@ -701,6 +744,30 @@ do {
 } catch {
     failures += 1
     print("FAIL  合法说明标题保护抛出异常：\(error)")
+}
+do {
+    let preparedResponse = try RewriteResultPolicy.prepare(
+        "正文逻辑有点乱，前后说法也不一致，怎么优化？",
+        preservingBoundaryWhitespaceOf: "正文里面的逻辑有点乱，而且前后说法不一致。怎么优化？"
+    )
+    check(
+        preparedResponse == "正文逻辑有点乱，前后说法也不一致。",
+        "面向编辑器的尾部润色要求不会写回成稿"
+    )
+} catch {
+    failures += 1
+    print("FAIL  尾部润色要求清理抛出异常：\(error)")
+}
+do {
+    let source = "我们正在讨论这段文案怎么优化？"
+    let preparedResponse = try RewriteResultPolicy.prepare(
+        source,
+        preservingBoundaryWhitespaceOf: source
+    )
+    check(preparedResponse == source, "讨论编辑工作的正文不会被误删")
+} catch {
+    failures += 1
+    print("FAIL  编辑讨论正文保护抛出异常：\(error)")
 }
 expectThrow("模型结果拒绝纯空白内容") {
     _ = try RewriteResultPolicy.prepare(
@@ -905,10 +972,11 @@ let neutralCommunicationPolicy = CommunicationPolicy(
     messageExpansionRatio: 1.35
 )
 check(
-    neutralCommunicationPolicy.modelInstruction.contains("至少完成一处具体改进")
-        && neutralCommunicationPolicy.modelInstruction.contains("只有原文已经自然准确时才保持不变")
-        && !neutralCommunicationPolicy.modelInstruction.contains("只做最小必要修改"),
-    "沟通策略不会抵消主动优化规则"
+    neutralCommunicationPolicy.modelInstruction.contains("只决定沟通口吻和组织方式")
+        && neutralCommunicationPolicy.modelInstruction.contains("不能覆盖事实保护边界")
+        && neutralCommunicationPolicy.modelInstruction.contains("礼貌不等于正式")
+        && !neutralCommunicationPolicy.modelInstruction.contains("只有原文已经自然准确时才保持不变"),
+    "沟通策略只提供风格上下文，不重复基础编辑规则"
 )
 
 let learnedCommunicationPolicy = CommunicationPolicy(
@@ -1387,11 +1455,20 @@ check(
     "事实守卫接受保留动作和先后关系的自然聊天改写"
 )
 check(
-    MessagingRewriteRetryPolicy.shouldRetryUnchanged(
+    !FactGuard.audit(
+        sourceText: "帮我拿瓶可乐打开，再拿个小蛋糕给我吃",
+        result: StructuredRewriteResult(rewrittenText: "帮我拿瓶可乐打开，再拿个小蛋糕"),
+        applicationRole: .messaging,
+        expansionRatio: 1.35
+    ).accepted,
+    "事实守卫拒绝删除吃喝等日常关键动作"
+)
+check(
+    !MessagingRewriteRetryPolicy.shouldRetryUnchanged(
         sourceText: "这个方案我再看看",
         candidate: "这个方案我再看看"
     ),
-    "较完整聊天原样返回时再尝试一次有效改写"
+    "自然完整的短消息不为制造变化而重试"
 )
 check(
     !MessagingRewriteRetryPolicy.shouldRetryUnchanged(
@@ -1399,6 +1476,60 @@ check(
         candidate: "好的"
     ),
     "自然短回复不为制造变化而重复请求"
+)
+check(
+    MessagingRewriteRetryPolicy.shouldRetryUnchanged(
+        sourceText: "这个结果不对，，麻烦再检查一下！！",
+        candidate: "这个结果不对，，麻烦再检查一下！！"
+    ),
+    "原样候选没有处理明确标点问题时会重试"
+)
+check(
+    !RewriteQualityGuard.audit(
+        sourceText: "这个问题我再确认一下。",
+        outputText: "现将该问题的确认情况同步如下。",
+        applicationRole: .messaging
+    ).accepted,
+    "质量门拒绝把聊天改成工作汇报"
+)
+check(
+    !RewriteQualityGuard.audit(
+        sourceText: "正文逻辑有点乱。怎么优化？",
+        outputText: "正文的逻辑有些乱，怎么优化？",
+        applicationRole: .messaging
+    ).accepted,
+    "质量门拒绝把面向编辑器的要求留在成稿中"
+)
+check(
+    RewriteQualityGuard.audit(
+        sourceText: "这个方案我再看看",
+        outputText: "这个方案我再看看",
+        applicationRole: .messaging
+    ).accepted,
+    "质量门允许已经自然的短消息保持不变"
+)
+check(RewriteQualityCorpus.core.count == 40, "润色质量基线包含 40 条脱敏样例")
+let qualityCasesRequiringImprovement = RewriteQualityCorpus.core.filter(\.requiresImprovement)
+let retryCoveredQualityCases = qualityCasesRequiringImprovement.filter {
+    MessagingRewriteRetryPolicy.shouldRetryUnchanged(
+        sourceText: $0.sourceText,
+        candidate: $0.sourceText
+    )
+}
+check(
+    retryCoveredQualityCases.count >= 28,
+    "原样返回重试策略覆盖大部分明确可优化样例"
+)
+check(
+    RewriteQualityCorpus.core
+        .filter { !$0.requiresImprovement }
+        .allSatisfy {
+            !MessagingRewriteRetryPolicy.shouldRetryUnchanged(
+                sourceText: $0.sourceText,
+                candidate: $0.sourceText
+            )
+        },
+    "质量基线中的自然短消息不会被强制改写"
 )
 check(
     RewriteAlignmentGuard.audit(
@@ -1431,6 +1562,14 @@ check(
         applicationRole: .document
     ).accepted,
     "保留含义的正常语法和词语优化不会被对齐审计误拒绝"
+)
+check(
+    RewriteAlignmentGuard.audit(
+        sourceText: "目前来说这边的话还没有收到相关的一个回复。",
+        outputText: "目前还没收到相关回复。",
+        applicationRole: .messaging
+    ).accepted,
+    "聊天中的明确赘余可以在不丢信息的前提下大幅精简"
 )
 check(
     !RewriteHighlightPlanner.plan(
@@ -1496,6 +1635,17 @@ check(
         expansionRatio: 1.35
     ).accepted,
     "事实守卫要求逐字保留代码、参数和专业名词"
+)
+check(
+    FactGuard.audit(
+        sourceText: "请保留/Users/zh/Documents/test/spacepolish这个路径，其他表达可以优化。",
+        result: StructuredRewriteResult(
+            rewrittenText: "请保留路径 /Users/zh/Documents/test/spacepolish，其他表达可优化。"
+        ),
+        applicationRole: .development,
+        expansionRatio: 1.35
+    ).accepted,
+    "路径逐字保留时允许调整路径周围的说明文字"
 )
 check(
     !VoiceGuard.audit(

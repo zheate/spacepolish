@@ -58,8 +58,15 @@ struct RewriteAlignmentAuditResult: Equatable {
     let introducedOutputRatio: Double
 }
 
+struct RewriteQualityAuditResult: Equatable {
+    let accepted: Bool
+    let issues: [String]
+    let meaningfullyChanged: Bool
+}
+
 enum RewriteSafetyError: LocalizedError {
     case rejected([String])
+    case qualityRejected([String])
 
     var errorDescription: String? {
         switch self {
@@ -68,6 +75,11 @@ enum RewriteSafetyError: LocalizedError {
             return detail.isEmpty
                 ? "候选结果未通过本地事实与声音检查"
                 : "候选结果未通过安全检查：\(detail)"
+        case .qualityRejected(let issues):
+            let detail = issues.prefix(2).joined(separator: "；")
+            return detail.isEmpty
+                ? "候选结果没有达到可直接使用的质量"
+                : "候选结果仍不够好：\(detail)"
         }
     }
 }
@@ -105,7 +117,9 @@ enum FactGuard {
         ["安排", "预约", "排期", "约一下", "约下"],
         ["完成", "做完", "弄完", "搞定"],
         ["拒绝", "不同意", "不接受"],
-        ["回复", "答复", "反馈", "回我", "回你", "回他", "回她", "回一下", "回下"]
+        ["回复", "答复", "反馈", "回我", "回你", "回他", "回她", "回一下", "回下"],
+        ["打开", "开启", "开一下", "开下"],
+        ["吃", "喝", "吃掉", "喝掉"]
     ]
     private static let riskyIntroductions: [(label: String, markers: [String])] = [
         ("时间", ["今天", "明天", "后天", "本周", "下周", "周一", "周二", "周三", "周四", "周五", "月底"]),
@@ -265,18 +279,36 @@ enum FactGuard {
 
     private static func looksLikeTechnicalLiteral(_ line: String) -> Bool {
         guard line.count >= 3 else { return false }
+        let standalonePathPattern = #"^(?:~?/|[A-Za-z]:\\)[^\s]+$"#
+        let isStandalonePath = (try? NSRegularExpression(
+            pattern: standalonePathPattern
+        ))?.firstMatch(
+            in: line,
+            range: NSRange(line.startIndex..<line.endIndex, in: line)
+        ) != nil
         return line.hasPrefix("$")
             || line.hasPrefix("git ")
             || line.hasPrefix("swift ")
             || line.hasPrefix("npm ")
             || line.hasPrefix("curl ")
-            || line.contains("/") && !line.contains(" ")
+            || isStandalonePath
             || line.hasPrefix("```")
     }
 }
 
 enum MessagingRewriteRetryPolicy {
-    static let unchangedIssue = "候选与原文完全相同；请在不改变意思和语气的前提下，至少完成一处真实改善。"
+    static let unchangedIssue = "候选仍与原文相同；原文存在可明确处理的表达问题，请逐项修正后给出一版真正改善的成稿。"
+
+    private static let naturallyCompleteShortMessages: Set<String> = [
+        "好", "好的", "行", "可以", "收到", "知道了", "明白", "明白了", "没问题",
+        "谢谢", "谢谢你", "辛苦了", "嗯", "嗯嗯", "我再看看", "这个方案我再看看"
+    ]
+
+    private static let explicitIssueMarkers = [
+        "怎么优化", "帮我润色", "优化一下", "润色一下", "修改一下",
+        "的的", "进行一个", "来进行", "然后的话", "目的主要是为了",
+        "目前来说", "这边的话", "相关的一个", "通讯", "相对来说比较"
+    ]
 
     static func shouldRetryUnchanged(
         sourceText: String,
@@ -284,7 +316,131 @@ enum MessagingRewriteRetryPolicy {
     ) -> Bool {
         let source = normalized(sourceText)
         let output = normalized(candidate)
-        return source.count >= 6 && source == output
+        guard source == output,
+              source.count >= 6,
+              !naturallyCompleteShortMessages.contains(source) else {
+            return false
+        }
+        return !improvementReasons(in: source).isEmpty
+    }
+
+    static func improvementReasons(in sourceText: String) -> [String] {
+        let source = normalized(sourceText)
+        guard !source.isEmpty else { return [] }
+
+        var reasons: [String] = []
+        if explicitIssueMarkers.contains(where: source.contains) {
+            reasons.append("存在可修正的搭配、赘余、术语或编辑指令")
+        }
+        if containsRepeatedPunctuation(in: source) {
+            reasons.append("标点存在重复或混用")
+        }
+        let clauseSeparators = source.filter { "，,；;：:".contains($0) }.count
+        if source.count >= 14, clauseSeparators >= 2 {
+            reasons.append("多个分句需要检查衔接和节奏")
+        } else if source.count >= 28 {
+            reasons.append("较长表达需要检查语序和冗余")
+        }
+        if occurrences(of: "帮我", in: source) >= 2
+            || occurrences(of: "然后", in: source) >= 2
+            || occurrences(of: "一下", in: source) >= 3 {
+            reasons.append("口语成分存在可压缩的机械重复")
+        }
+        return reasons
+    }
+
+    static func containsTrailingEditorInstruction(in text: String) -> Bool {
+        let pattern = #"(?:怎么优化|帮我润色|优化一下|润色一下|帮我修改|修改一下)[？?。!！\s]*$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return false }
+        return regex.firstMatch(
+            in: text,
+            range: NSRange(text.startIndex..<text.endIndex, in: text)
+        ) != nil
+    }
+
+    private static func normalized(_ text: String) -> String {
+        text.precomposedStringWithCanonicalMapping
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func containsRepeatedPunctuation(in text: String) -> Bool {
+        let pattern = #"[，,。.!！?？；;：:]{2,}"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return false }
+        return regex.firstMatch(
+            in: text,
+            range: NSRange(text.startIndex..<text.endIndex, in: text)
+        ) != nil
+    }
+
+    private static func occurrences(of needle: String, in text: String) -> Int {
+        guard !needle.isEmpty else { return 0 }
+        var count = 0
+        var searchRange = text.startIndex..<text.endIndex
+        while let range = text.range(of: needle, range: searchRange) {
+            count += 1
+            searchRange = range.upperBound..<text.endIndex
+        }
+        return count
+    }
+}
+
+enum RewriteQualityGuard {
+    private static let reportStylePhrases = [
+        "现将", "现同步", "经沟通确认", "相关事宜", "综上所述", "具体如下",
+        "烦请知悉", "请您知悉", "特此说明", "后续将持续", "高度重视"
+    ]
+
+    static func audit(
+        sourceText: String,
+        outputText: String,
+        applicationRole: ApplicationWritingRole
+    ) -> RewriteQualityAuditResult {
+        let source = normalized(sourceText)
+        let output = normalized(outputText)
+        let changed = source != output
+        var issues: [String] = []
+
+        if applicationRole == .messaging,
+           !changed,
+           MessagingRewriteRetryPolicy.shouldRetryUnchanged(
+               sourceText: sourceText,
+               candidate: outputText
+           ) {
+            let reasons = MessagingRewriteRetryPolicy.improvementReasons(in: sourceText)
+                .prefix(2)
+                .joined(separator: "、")
+            issues.append(
+                reasons.isEmpty
+                    ? MessagingRewriteRetryPolicy.unchangedIssue
+                    : "候选没有处理原文中的问题：\(reasons)"
+            )
+        }
+
+        if applicationRole == .messaging {
+            if MessagingRewriteRetryPolicy.containsTrailingEditorInstruction(in: source),
+               MessagingRewriteRetryPolicy.containsTrailingEditorInstruction(in: output) {
+                issues.append("输出仍包含面向编辑器的润色要求")
+            }
+            for phrase in reportStylePhrases
+                where output.contains(phrase) && !source.contains(phrase) {
+                issues.append("输出引入了工作汇报或公文式表达：\(phrase)")
+            }
+            if source.count <= 48,
+               !source.contains("\n"),
+               output.contains("\n") {
+                issues.append("简短聊天被扩写成了分段文本")
+            }
+            if source.count >= 8,
+               output.count > max(source.count + 20, Int(Double(source.count) * 1.65)) {
+                issues.append("聊天结果扩写过多，不像原有表达节奏")
+            }
+        }
+
+        return RewriteQualityAuditResult(
+            accepted: issues.isEmpty,
+            issues: Array(issues.prefix(3)),
+            meaningfullyChanged: changed
+        )
     }
 
     private static func normalized(_ text: String) -> String {
@@ -315,6 +471,9 @@ enum RewriteAlignmentGuard {
         let introducedOutputRatio = 1 - Double(retainedCount) / Double(output.count)
         let outputLengthRatio = Double(output.count) / Double(source.count)
         let minimumRetention = applicationRole == .messaging ? 0.46 : 0.38
+        let allowsConciseCleanup = applicationRole == .messaging
+            && !MessagingRewriteRetryPolicy.improvementReasons(in: sourceText).isEmpty
+            && retainedSourceRatio >= 0.45
         var issues: [String] = []
 
         if retainedSourceRatio < minimumRetention,
@@ -323,7 +482,8 @@ enum RewriteAlignmentGuard {
         }
         if source.count >= 18,
            outputLengthRatio < 0.55,
-           retainedSourceRatio < 0.66 {
+           retainedSourceRatio < 0.66,
+           !allowsConciseCleanup {
             issues.append("输出大幅压缩了原文，可能删除了必要信息")
         }
         if outputLengthRatio > 1.85,
@@ -371,7 +531,8 @@ enum RewriteAlignmentGuard {
 enum VoiceGuard {
     private static let formalPhrases = [
         "尊敬的", "感谢您的理解与支持", "我们高度重视", "诚挚感谢", "非常荣幸",
-        "敬请知悉", "特此说明", "后续将持续推进"
+        "敬请知悉", "烦请知悉", "特此说明", "后续将持续推进", "综上所述",
+        "现将", "现同步", "具体如下"
     ]
 
     static func audit(

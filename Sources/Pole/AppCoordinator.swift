@@ -39,6 +39,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         let outcome: OptimizationOutcome
         let action: RewriteAction
         let retried: Bool
+        let retryReason: String?
     }
 
     private struct RecentRewriteFeedbackContext {
@@ -49,6 +50,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
 
     private final class RewriteAttemptState: @unchecked Sendable {
         var retried = false
+        var retryReason: String?
     }
 
     let model = AppModel()
@@ -651,6 +653,11 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         outputText: first.rewrittenText,
                         applicationRole: communicationContext.applicationContext.role
                     )
+                    let firstQualityAudit = RewriteQualityGuard.audit(
+                        sourceText: context.sourceText,
+                        outputText: first.rewrittenText,
+                        applicationRole: communicationContext.applicationContext.role
+                    )
                     self.activePerformanceTrace?.record(
                         .firstGuard,
                         since: firstGuardStartedAt
@@ -658,21 +665,22 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                     let firstWasSafe = firstFactAudit.accepted
                         && firstVoiceAudit.accepted
                         && firstAlignmentAudit.accepted
-                    let shouldRetryUnchanged = communicationContext.applicationContext.role == .messaging
-                        && MessagingRewriteRetryPolicy.shouldRetryUnchanged(
-                            sourceText: context.sourceText,
-                            candidate: first.rewrittenText
-                        )
-                    if firstWasSafe, !shouldRetryUnchanged {
+                    let firstWasAccepted = firstWasSafe && firstQualityAudit.accepted
+                    if firstWasAccepted {
                         result = first.rewrittenText
                     } else {
                         attemptState.retried = true
-                        var issues = firstFactAudit.issues
+                        if !firstWasSafe, !firstQualityAudit.accepted {
+                            attemptState.retryReason = "safety_and_quality"
+                        } else if !firstWasSafe {
+                            attemptState.retryReason = "safety"
+                        } else {
+                            attemptState.retryReason = "quality"
+                        }
+                        let issues = firstFactAudit.issues
                             + firstVoiceAudit.issues
                             + firstAlignmentAudit.issues
-                        if shouldRetryUnchanged {
-                            issues.append(MessagingRewriteRetryPolicy.unchangedIssue)
-                        }
+                            + firstQualityAudit.issues
                         let retry = StructuredRewriteResult(
                             rewrittenText: try await self.requestOptimization(
                                 text: context.sourceText,
@@ -702,23 +710,38 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                             outputText: retry.rewrittenText,
                             applicationRole: communicationContext.applicationContext.role
                         )
+                        let retryQualityAudit = RewriteQualityGuard.audit(
+                            sourceText: context.sourceText,
+                            outputText: retry.rewrittenText,
+                            applicationRole: communicationContext.applicationContext.role
+                        )
                         self.activePerformanceTrace?.record(
                             .retryGuard,
                             since: retryGuardStartedAt
                         )
                         if retryFactAudit.accepted,
                            retryVoiceAudit.accepted,
-                           retryAlignmentAudit.accepted {
+                           retryAlignmentAudit.accepted,
+                           retryQualityAudit.accepted {
                             result = retry.rewrittenText
-                        } else if firstWasSafe {
-                            // An unchanged first result is still safer than a retry
-                            // that introduced a fact or voice regression.
+                        } else if firstWasSafe,
+                                  !firstQualityAudit.meaningfullyChanged {
+                            // If both attempts fail to produce a safe improvement,
+                            // preserving the user's original text is the only honest
+                            // fallback. It remains classified as unchanged rather than
+                            // being presented as a successful rewrite.
                             result = first.rewrittenText
                         } else {
+                            let retrySafetyIssues = retryFactAudit.issues
+                                + retryVoiceAudit.issues
+                                + retryAlignmentAudit.issues
+                            if retrySafetyIssues.isEmpty {
+                                throw RewriteSafetyError.qualityRejected(
+                                    retryQualityAudit.issues
+                                )
+                            }
                             throw RewriteSafetyError.rejected(
-                                retryFactAudit.issues
-                                    + retryVoiceAudit.issues
-                                    + retryAlignmentAudit.issues
+                                retrySafetyIssues + retryQualityAudit.issues
                             )
                         }
                     }
@@ -786,7 +809,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         cursorUTF16: finalCursorUTF16,
                         outcome: outcome,
                         action: action,
-                        retried: attemptState.retried
+                        retried: attemptState.retried,
+                        retryReason: attemptState.retryReason
                     )
                     self.activePerformanceTrace?.record(
                         .writeback,
@@ -811,7 +835,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                     self.model.statusText = self.failureStatusText(for: error)
                     self.activePerformanceTrace?.finish(
                         outcome: "failed",
-                        retried: attemptState.retried
+                        retried: attemptState.retried,
+                        retryReason: attemptState.retryReason
                     )
                     self.activePerformanceTrace = nil
                 }
@@ -994,7 +1019,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             let outcome = completion.outcome == .unchanged ? "unchanged" : "changed"
             self.activePerformanceTrace?.finish(
                 outcome: outcome,
-                retried: completion.retried
+                retried: completion.retried,
+                retryReason: completion.retryReason
             )
             self.activePerformanceTrace = nil
             self.model.isProcessing = false
