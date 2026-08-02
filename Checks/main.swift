@@ -1,4 +1,8 @@
+import AppKit
 import Foundation
+#if SWIFT_PACKAGE
+@testable import PoleCore
+#endif
 
 private var failures = 0
 
@@ -51,6 +55,164 @@ private func waitForAsync<T>(
     semaphore.wait()
     return box.get()!
 }
+
+func runPoleRegressionChecks() -> Int {
+failures = 0
+
+do {
+    let pasteboard = NSPasteboard.withUniqueName()
+    defer { pasteboard.releaseGlobally() }
+    let first = NSPasteboardItem()
+    first.setString("原始文本", forType: .string)
+    first.setData(Data("<b>原始文本</b>".utf8), forType: .html)
+    let second = NSPasteboardItem()
+    second.setString("第二项", forType: .string)
+    pasteboard.writeObjects([first, second])
+
+    let transaction = ClipboardTransaction(pasteboard: pasteboard)
+    check(transaction.writeString("Pole 临时内容"), "剪贴板事务可以写入临时内容")
+    transaction.restoreIfOwned()
+    check(
+        pasteboard.pasteboardItems?.count == 2
+            && pasteboard.pasteboardItems?.first?.string(forType: .string) == "原始文本"
+            && pasteboard.pasteboardItems?.first?.data(forType: .html)
+                == Data("<b>原始文本</b>".utf8),
+        "剪贴板事务完整恢复多项目和多类型内容"
+    )
+}
+
+do {
+    let pasteboard = NSPasteboard.withUniqueName()
+    defer { pasteboard.releaseGlobally() }
+    pasteboard.clearContents()
+    pasteboard.setString("原始内容", forType: .string)
+
+    let transaction = ClipboardTransaction(pasteboard: pasteboard)
+    check(transaction.writeString("Pole 临时内容"), "剪贴板事务记录所有权")
+    pasteboard.clearContents()
+    pasteboard.setString("用户新复制的内容", forType: .string)
+    transaction.restoreIfOwned()
+    check(
+        pasteboard.string(forType: .string) == "用户新复制的内容",
+        "外部剪贴板变化后绝不恢复旧内容"
+    )
+}
+
+do {
+    let pasteboard = NSPasteboard.withUniqueName()
+    defer { pasteboard.releaseGlobally() }
+    pasteboard.clearContents()
+
+    let emptyTransaction = ClipboardTransaction(pasteboard: pasteboard)
+    check(emptyTransaction.writeString("Pole 临时内容"), "空剪贴板可以进入事务")
+    emptyTransaction.restoreIfOwned()
+    check(
+        pasteboard.pasteboardItems?.isEmpty != false,
+        "空剪贴板在事务结束后恢复为空"
+    )
+
+    pasteboard.clearContents()
+    pasteboard.setString("原始内容", forType: .string)
+    let claimedTransaction = ClipboardTransaction(pasteboard: pasteboard)
+    check(claimedTransaction.writeString("复制前标记"), "读取事务写入专用标记")
+    pasteboard.clearContents()
+    pasteboard.setString("目标应用复制结果", forType: .string)
+    check(claimedTransaction.claimCurrentContents(), "读取事务可以重新取得所有权")
+    pasteboard.clearContents()
+    pasteboard.setString("用户随后复制的内容", forType: .string)
+    claimedTransaction.restoreIfOwned()
+    check(
+        pasteboard.string(forType: .string) == "用户随后复制的内容",
+        "读取事务取得所有权后仍不覆盖后续外部复制"
+    )
+}
+
+do {
+    let fullBoundary = String(repeating: "文", count: 4_000)
+    let fullPlan = try TextRangePlanner.plan(
+        text: fullBoundary,
+        selectedRange: NSRange(location: (fullBoundary as NSString).length, length: 0)
+    )
+    try RewriteInputPolicy.validate(fullPlan)
+    check(!fullPlan.isExplicitSelection, "全文 4,000 字符边界允许处理")
+
+    let tooLong = String(repeating: "文", count: 4_001)
+    let tooLongPlan = try TextRangePlanner.plan(
+        text: tooLong,
+        selectedRange: NSRange(location: (tooLong as NSString).length, length: 0)
+    )
+    do {
+        try RewriteInputPolicy.validate(tooLongPlan)
+        check(false, "全文超过 4,000 字符时要求选区")
+    } catch {
+        check(error as? RewriteInputError == .wholeFieldTooLong, "全文超过 4,000 字符时要求选区")
+    }
+
+    let selectedBoundary = String(repeating: "🙂", count: 12_000)
+    let selectedPlan = try TextRangePlanner.plan(
+        text: selectedBoundary,
+        selectedRange: NSRange(location: 0, length: (selectedBoundary as NSString).length)
+    )
+    try RewriteInputPolicy.validate(selectedPlan)
+    check(selectedPlan.isExplicitSelection, "显式 Emoji 选区按 12,000 个 Character 计数")
+
+    let selectedTooLong = String(repeating: "文", count: 12_001)
+    let selectedTooLongPlan = try TextRangePlanner.plan(
+        text: selectedTooLong,
+        selectedRange: NSRange(location: 0, length: (selectedTooLong as NSString).length)
+    )
+    do {
+        try RewriteInputPolicy.validate(selectedTooLongPlan)
+        check(false, "选区超过 12,000 字符时拒绝请求")
+    } catch {
+        check(error as? RewriteInputError == .selectionTooLong, "选区超过 12,000 字符时拒绝请求")
+    }
+} catch {
+    check(false, "文本输入限制检查抛出异常：\(error)")
+}
+
+let coordinatorResult = MainActor.assumeIsolated {
+    let coordinator = RewriteCoordinator()
+    var observedCancellation: RewriteCancellationReason?
+    let firstRequest = coordinator.beginRequest()
+    let firstTask = Task<Void, Never> {
+        try? await Task.sleep(nanoseconds: 5_000_000_000)
+    }
+    coordinator.attach(firstTask, to: firstRequest)
+
+    let secondRequest = coordinator.beginRequest { reason in
+        observedCancellation = reason
+    }
+    let staleTask = Task<Void, Never> {
+        try? await Task.sleep(nanoseconds: 5_000_000_000)
+    }
+    coordinator.attach(staleTask, to: firstRequest)
+    let lateResultRejected = !coordinator.isCurrent(firstRequest)
+        && coordinator.isCurrent(secondRequest)
+        && firstTask.isCancelled
+        && staleTask.isCancelled
+
+    let activeTask = Task<Void, Never> {
+        try? await Task.sleep(nanoseconds: 5_000_000_000)
+    }
+    coordinator.attach(activeTask, to: secondRequest)
+    coordinator.cancel(.paused)
+    return (
+        lateResultRejected,
+        activeTask.isCancelled && !coordinator.hasActiveRequest,
+        observedCancellation == .paused
+    )
+}
+check(coordinatorResult.0, "新请求会取消旧任务并拒绝迟到结果")
+check(coordinatorResult.1, "暂停会取消当前任务并清理活动请求")
+check(coordinatorResult.2, "采集阶段暂停也会立即更新取消状态")
+
+check(
+    RewriteCancellationReason.applicationChanged.statusText.contains("前台应用已切换")
+        && RewriteCancellationReason.targetChanged.statusText.contains("输入目标已切换")
+        && RewriteCancellationReason.textChanged.statusText.contains("输入内容已变化"),
+    "自动取消原因向用户说明具体目标变化"
+)
 
 do {
     let lockURL = FileManager.default.temporaryDirectory
@@ -738,6 +900,136 @@ check(
         && !ExpansionPolicy.shouldRequireExpansion("好的")
         && !ExpansionPolicy.shouldRequireExpansion("这是一句已经完整清楚而且没有可展开关系的表达。"),
     "扩写策略只要求有足够信息的文本产生扩写"
+)
+let recentMessageTime = Date()
+func recentMessage(
+    _ id: String,
+    _ direction: ConversationMessageDirection,
+    _ text: String,
+    offset: TimeInterval = 0
+) -> ConversationMessage {
+    ConversationMessage(
+        id: id,
+        conversationID: "contextual-expansion-check",
+        timestamp: recentMessageTime.addingTimeInterval(offset),
+        direction: direction,
+        senderID: nil,
+        kind: .text,
+        text: text
+    )
+}
+let analyzedRecentContext = RecentConversationAnalyzer.analyze(messages: [
+    recentMessage("received-old", .received, "为什么还不能确认？", offset: -2),
+    recentMessage("received-latest", .received, "这个指标什么时候能确认？", offset: -1),
+    recentMessage("sent-latest", .sent, "我先看一下", offset: 0)
+])
+check(
+    analyzedRecentContext.questionType == .timing
+        && analyzedRecentContext.confidence == 0.9,
+    "最近会话只从最后一条对方文本提炼问题类型"
+)
+let recentQuestionChecks: [(String, RecentQuestionType)] = [
+    ("这个能做到吗？", .feasibility),
+    ("现在进展怎么样了？", .status),
+    ("为什么会这样？", .reason),
+    ("这个怎么处理？", .action),
+    ("规格确认了吗？", .confirmation)
+]
+check(
+    recentQuestionChecks.allSatisfy { text, expected in
+        RecentConversationAnalyzer.analyze(messages: [
+            recentMessage(UUID().uuidString, .received, text)
+        ]).questionType == expected
+    },
+    "最近会话本地识别可行性、进展、原因、处理和确认问题"
+)
+let contextualPolicy = CommunicationPolicy(
+    intent: .inform,
+    relationshipRole: .customer,
+    relationshipConfidence: 0.9,
+    dimensions: .defaults(for: .customer),
+    voice: VoiceMetrics(),
+    voiceSampleCount: 0,
+    customInstruction: nil,
+    messageExpansionRatio: 1.35
+)
+let contextualCommunicationContext = CommunicationContext(
+    applicationContext: ApplicationContext(
+        bundleIdentifier: "com.tencent.xinwechat",
+        displayName: "微信",
+        role: .messaging
+    ),
+    conversationSnapshot: nil,
+    relationship: nil,
+    intent: .inform,
+    voice: VoiceProfile(),
+    policy: contextualPolicy,
+    dataConfidence: 0.9
+)
+let contextualPlan = ContextualExpansionPlanner.plan(
+    sourceText: "这个指标还不能确认，需要验证后才能给结论。",
+    communicationContext: contextualCommunicationContext,
+    recentContext: analyzedRecentContext
+)
+check(
+    contextualPlan.questionType == .timing
+        && contextualPlan.relationshipRole == .customer
+        && contextualPlan.operations.contains(.connectClauses)
+        && contextualPlan.operations.contains(.clarifyReference)
+        && contextualPlan.requiresVisibleExpansion,
+    "上下文扩写计划组合应用、对象、问题类型与允许动作"
+)
+check(
+    contextualPlan.modelInstruction.contains("当前对话倾向于询问时间")
+        && contextualPlan.modelInstruction.contains("沟通对象类别：客户")
+        && contextualPlan.modelInstruction.contains("原文没有时间信息时")
+        && !contextualPlan.modelInstruction.contains("这个指标什么时候能确认"),
+    "扩写提示只携带本地摘要而不携带历史消息正文"
+)
+let shortNoOpPlan = ContextualExpansionPlanner.plan(
+    sourceText: "好的",
+    communicationContext: contextualCommunicationContext,
+    recentContext: analyzedRecentContext
+)
+check(
+    !shortNoOpPlan.requiresVisibleExpansion
+        && shortNoOpPlan.modelInstruction.contains("允许逐字保持原文"),
+    "自然短回复在上下文扩写中仍保持安全不扩写"
+)
+check(
+    ContextualExpansionGuard.audit(
+        sourceText: "这个指标还不能确认，需要验证后才能给结论。",
+        outputText: "这个指标目前还不能确认，需要完成验证后才能给出最终结论。",
+        plan: contextualPlan
+    ).accepted,
+    "上下文扩写审查接受达到幅度且忠实整理的结果"
+)
+check(
+    !ContextualExpansionGuard.audit(
+        sourceText: "这个指标还不能确认，需要验证后才能给结论。",
+        outputText: "这个指标还不能确认，需要验证。",
+        plan: contextualPlan
+    ).accepted,
+    "上下文扩写审查拒绝只有等长整理的候选"
+)
+let recentCacheCheck = waitForAsync {
+    let cache = RecentContextCache(lifetime: 120)
+    let now = Date()
+    let context = RecentConversationContext(questionType: .status, confidence: 0.9)
+    await cache.save(context, for: "wechat|customer", now: now)
+    let live = await cache.context(
+        for: "wechat|customer",
+        now: now.addingTimeInterval(60)
+    )
+    let expired = await cache.context(
+        for: "wechat|customer",
+        now: now.addingTimeInterval(121)
+    )
+    return live == context && expired == nil
+}
+check(
+    (try? recentCacheCheck.get()) == true,
+    "最近会话摘要缓存两分钟并在过期后清除"
 )
 let numberedParallelText = "需要确认以下四项：\n1、规格\n2、数量\n3、交期\n4、局部镀范围"
 check(
@@ -1852,6 +2144,47 @@ check(
 )
 check(RewriteQualityCorpus.core.count == 40, "润色质量基线包含 40 条脱敏样例")
 check(ExpansionQualityCorpus.core.count == 22, "适当扩写质量基线包含 22 条脱敏样例")
+check(
+    ContextualExpansionCorpus.core.count == 5
+        && ContextualExpansionCorpus.core.allSatisfy { !$0.forbiddenPhrases.isEmpty },
+    "上下文扩写质量基线覆盖问题类型、关系与禁止新增内容"
+)
+check(
+    ContextualExpansionCorpus.core.allSatisfy { sample in
+        let policy = CommunicationPolicy(
+            intent: .inform,
+            relationshipRole: sample.relationshipRole,
+            relationshipConfidence: sample.relationshipRole == nil ? 0 : 0.9,
+            dimensions: sample.relationshipRole.map(RelationshipDimensions.defaults),
+            voice: VoiceMetrics(),
+            voiceSampleCount: 0,
+            customInstruction: nil,
+            messageExpansionRatio: 1.35
+        )
+        let communicationContext = CommunicationContext(
+            applicationContext: ApplicationContext(
+                bundleIdentifier: "com.tencent.xinwechat",
+                displayName: "微信",
+                role: .messaging
+            ),
+            conversationSnapshot: nil,
+            relationship: nil,
+            intent: .inform,
+            voice: VoiceProfile(),
+            policy: policy,
+            dataConfidence: 0.9
+        )
+        return ContextualExpansionPlanner.plan(
+            sourceText: sample.sourceText,
+            communicationContext: communicationContext,
+            recentContext: RecentConversationContext(
+                questionType: sample.questionType,
+                confidence: 0.9
+            )
+        ).requiresVisibleExpansion == sample.requiresVisibleExpansion
+    },
+    "上下文扩写语料与本地计划的可感知扩写判定一致"
+)
 let adaptivePolishMisses = RewriteQualityCorpus.core.filter {
     $0.requiresImprovement
         && AdaptivePolishPolicy.plan(
@@ -2158,6 +2491,57 @@ do {
         failures += 1
         print("FAIL  helper 能力协商：\(error)")
     }
+
+    let approvedIdentity: HelperIdentity
+    switch waitForAsync({ try await HelperIdentityService().inspect(helperURL) }) {
+    case .success(let identity):
+        approvedIdentity = identity
+        check(identity.sha256.count == 64, "helper 身份包含 SHA-256")
+        check(
+            identity.signature == .unsigned
+                && identity.signature.displayText == "未签名",
+            "未签名 helper 会明确展示签名状态"
+        )
+    case .failure(let error):
+        throw error
+    }
+    let trustSuiteName = "PoleHelperTrustChecks-\(UUID().uuidString)"
+    let trustDefaults = UserDefaults(suiteName: trustSuiteName)!
+    defer { trustDefaults.removePersistentDomain(forName: trustSuiteName) }
+    let trustStore = HelperTrustStore(defaults: trustDefaults)
+    trustStore.approve(approvedIdentity)
+    check(trustStore.approvedIdentity == approvedIdentity, "helper 信任身份可以持久化")
+
+    let changedHelperURL = tempDirectory.appendingPathComponent("changed-helper")
+    try Data(script.utf8).write(to: changedHelperURL)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: changedHelperURL.path
+    )
+    let changedApprovedIdentity: HelperIdentity
+    switch waitForAsync({ try await HelperIdentityService().inspect(changedHelperURL) }) {
+    case .success(let identity): changedApprovedIdentity = identity
+    case .failure(let error): throw error
+    }
+    try Data("#!/bin/sh\nprintf '{}'".utf8).write(to: changedHelperURL)
+    try FileManager.default.setAttributes(
+        [.posixPermissions: 0o755],
+        ofItemAtPath: changedHelperURL.path
+    )
+    switch waitForAsync({
+        try await ExternalHelperProvider(
+            executableURL: changedHelperURL,
+            approvedIdentity: changedApprovedIdentity
+        ).capabilities()
+    }) {
+    case .success:
+        check(false, "helper 文件变化后必须重新确认")
+    case .failure(let error):
+        check(
+            (error as? ConversationHelperError) == .helperIdentity(.changed),
+            "helper 文件变化后必须重新确认"
+        )
+    }
     let helperSnapshot = ConversationSnapshot(
         applicationIdentifier: "com.tencent.xinWeChat",
         processIdentifier: 42,
@@ -2307,6 +2691,32 @@ do {
     case .failure(let error):
         check((error as? ConversationHelperError) == .timedOut, "helper 超时必须终止")
     }
+
+    let cancellableURL = tempDirectory.appendingPathComponent("cancellable-helper")
+    try Data("#!/bin/sh\nsleep 5\nprintf '{}'".utf8).write(to: cancellableURL)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cancellableURL.path)
+    let cancellationStarted = Date()
+    switch waitForAsync({
+        let task = Task {
+            try await HelperProcessRunner().run(
+                executableURL: cancellableURL,
+                arguments: [],
+                timeout: 10,
+                maximumOutputBytes: 1_024
+            )
+        }
+        try await Task.sleep(nanoseconds: 80_000_000)
+        task.cancel()
+        return try await task.value
+    }) {
+    case .success:
+        check(false, "取消任务会终止 helper 子进程")
+    case .failure(let error):
+        check(
+            error is CancellationError && Date().timeIntervalSince(cancellationStarted) < 2,
+            "取消任务会终止 helper 子进程"
+        )
+    }
     try? FileManager.default.removeItem(at: tempDirectory)
 } catch {
     failures += 1
@@ -2315,7 +2725,15 @@ do {
 
 if failures > 0 {
     print("\n\(failures) 项检查失败")
-    exit(1)
+} else {
+    print("\n全部检查通过")
+}
+return failures
 }
 
-print("\n全部检查通过")
+#if POLE_STANDALONE_CHECKS
+let result = runPoleRegressionChecks()
+if result > 0 {
+    exit(1)
+}
+#endif

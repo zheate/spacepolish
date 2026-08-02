@@ -1,6 +1,7 @@
 import AppKit
 
-final class AppCoordinator: NSObject, NSMenuDelegate {
+@MainActor
+package final class AppCoordinator: NSObject, NSMenuDelegate {
     private enum RewriteAction {
         case polish
         case expand
@@ -73,7 +74,14 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
 
     private let client = QwenClient()
     private let textService = AccessibilityTextService()
+    private let textIOService = AccessibilityTextIOService()
     private let conversationResolver = ConversationResolver()
+    private lazy var conversationContextService = ConversationContextService(
+        resolver: conversationResolver
+    )
+    private let rewriteCoordinator = RewriteCoordinator()
+    private let rewritePipeline = RewritePipeline()
+    private let recentContextCache = RecentContextCache()
     private let monitor = DoubleOptionMonitor()
     private let hud = StatusHUD()
     private lazy var inputProgressIndicator = InputProgressIndicator(
@@ -90,7 +98,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     private var recentRewriteFeedbackContext: RecentRewriteFeedbackContext?
     private var activePerformanceTrace: RewritePerformanceTrace?
 
-    override init() {
+    package override init() {
         super.init()
 
         let statusIcon = NSImage(
@@ -124,7 +132,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         )
     }
 
-    func start() {
+    package func start() {
         if model.hasAPIKey {
             validateStoredAPIKey()
         }
@@ -142,7 +150,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         }
     }
 
-    func menuWillOpen(_ menu: NSMenu) {
+    package func menuWillOpen(_ menu: NSMenu) {
         rebuildMenu(menu)
     }
 
@@ -213,9 +221,14 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     }
 
     @objc private func toggleEnabled() {
+        let isPausing = model.isEnabled
         model.isEnabled.toggle()
         try? model.save()
-        model.statusText = model.isEnabled ? readyStatusText : "已暂停"
+        if isPausing, rewriteCoordinator.hasActiveRequest {
+            rewriteCoordinator.cancel(.paused)
+        } else {
+            model.statusText = model.isEnabled ? readyStatusText : "已暂停"
+        }
     }
 
     @objc private func expandCurrentText() {
@@ -237,7 +250,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         model.statusText = "反馈已在本机学习"
     }
 
-    @objc func openSettings() {
+    @objc package func openSettings() {
         if settingsController == nil {
             settingsController = SettingsWindowController(
                 model: model,
@@ -347,27 +360,99 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             return
         }
 
+        let requestID = rewriteCoordinator.beginRequest { [weak self] reason in
+            self?.handleAutomaticCancellation(reason)
+        }
         let trace = RewritePerformanceTrace(action: action.performanceName)
         activePerformanceTrace = trace
         let captureStartedAt = RewritePerformanceTrace.timestamp()
-        let context: CapturedTextContext
+        model.isProcessing = true
+        model.statusText = action.promptDescription
+        let captureTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let context = try await self.textIOService.captureTargetText()
+                try Task.checkCancellation()
+                guard self.rewriteCoordinator.isCurrent(requestID) else { return }
+                self.completeTriggerCapture(
+                    context,
+                    action: action,
+                    requestID: requestID,
+                    captureStartedAt: captureStartedAt,
+                    trace: trace
+                )
+            } catch is CancellationError {
+                return
+            } catch {
+                guard self.rewriteCoordinator.isCurrent(requestID) else { return }
+                trace.record(.capture, since: captureStartedAt)
+                trace.finish(outcome: "capture_failed", retried: false)
+                self.rewriteCoordinator.finish(requestID)
+                self.activePerformanceTrace = nil
+                self.inputProgressIndicator.fail()
+                self.model.isProcessing = false
+                self.model.statusText = (error as? LocalizedError)?.errorDescription
+                    ?? "无法读取当前输入框"
+            }
+        }
+        rewriteCoordinator.attach(captureTask, to: requestID)
+    }
+
+    private func completeTriggerCapture(
+        _ context: CapturedTextContext,
+        action: RewriteAction,
+        requestID: UUID,
+        captureStartedAt: UInt64,
+        trace: RewritePerformanceTrace
+    ) {
         do {
-            context = try textService.captureTargetText()
+            try RewriteInputPolicy.validate(
+                TextRewritePlan(
+                    capturedText: context.capturedText,
+                    cursorUTF16: context.cursorUTF16,
+                    replacementRange: context.replacementRange,
+                    sourceText: context.sourceText,
+                    isExplicitSelection: context.isExplicitSelection
+                )
+            )
         } catch {
-            trace.record(.capture, since: captureStartedAt)
-            trace.finish(outcome: "capture_failed", retried: false)
+            trace.finish(outcome: "input_rejected", retried: false)
+            rewriteCoordinator.finish(requestID)
             activePerformanceTrace = nil
             inputProgressIndicator.fail()
-            model.statusText = (error as? LocalizedError)?.errorDescription
-                ?? "无法读取当前输入框"
+            model.isProcessing = false
+            model.statusText = error.localizedDescription
+            hud.show(error.localizedDescription)
             return
         }
         trace.setInputLength(context.sourceText.count)
         trace.record(.capture, since: captureStartedAt)
+        rewriteCoordinator.monitor(
+            context: context,
+            requestID: requestID
+        ) { [weak self] reason in
+            self?.handleAutomaticCancellation(reason)
+        }
 
         switch action {
         case .polish, .expand:
-            handlePolishTrigger(context: context, action: action)
+            let contextStartedAt = RewritePerformanceTrace.timestamp()
+            let contextTask = Task { [weak self] in
+                guard let self else { return }
+                let snapshot = await self.conversationContextService
+                    .resolveCurrentConversation()
+                guard self.rewriteCoordinator.isCurrent(requestID) else { return }
+                self.activePerformanceTrace?.record(
+                    .conversationContext,
+                    since: contextStartedAt
+                )
+                self.handlePolishTrigger(
+                    context: context,
+                    snapshot: snapshot,
+                    action: action
+                )
+            }
+            rewriteCoordinator.attach(contextTask, to: requestID)
         case .translate:
             beginRewrite(
                 context: context,
@@ -381,14 +466,9 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
 
     private func handlePolishTrigger(
         context: CapturedTextContext,
+        snapshot: ConversationSnapshot?,
         action: RewriteAction = .polish
     ) {
-        let contextStartedAt = RewritePerformanceTrace.timestamp()
-        let snapshot = conversationResolver.resolveCurrentConversation()
-        activePerformanceTrace?.record(
-            .conversationContext,
-            since: contextStartedAt
-        )
         if action == .polish {
             let applicationContext = snapshot?.applicationContext
                 ?? ApplicationContextClassifier.context(bundleIdentifier: "unknown")
@@ -433,12 +513,17 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         let needsRefresh = existing?.lastAnalyzedAt.map {
             Date().timeIntervalSince($0) >= 86_400
         } ?? true
-        if action == .polish,
-           model.historyAnalysisEnabled,
-           needsRefresh,
+        if model.historyAnalysisEnabled,
            model.helperURL != nil,
-           snapshot.normalizedTitle != nil {
-            prepareHistoryContext(context: context, snapshot: snapshot, fallback: existing)
+           snapshot.normalizedTitle != nil,
+           (action == .expand || needsRefresh) {
+            prepareHistoryContext(
+                context: context,
+                snapshot: snapshot,
+                fallback: existing,
+                action: action,
+                refreshRelationship: needsRefresh
+            )
             return
         }
         if let existing {
@@ -469,64 +554,133 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     private func prepareHistoryContext(
         context: CapturedTextContext,
         snapshot: ConversationSnapshot,
-        fallback: RelationshipProfile?
+        fallback: RelationshipProfile?,
+        action: RewriteAction,
+        refreshRelationship: Bool
     ) {
         guard let helperURL = model.helperURL else {
-            beginPolish(context: context, snapshot: snapshot, relationship: fallback)
+            beginPolish(
+                context: context,
+                snapshot: snapshot,
+                relationship: fallback,
+                action: action
+            )
             return
         }
         model.isProcessing = true
         model.statusText = "正在理解当前会话…"
         showInputProgress(for: context, operation: .optimization)
-        let provider = ExternalHelperProvider(executableURL: helperURL)
+        guard let approvedIdentity = model.approvedHelperIdentity else {
+            model.helperStatusText = "需要重新确认 helper 身份"
+            beginPolish(
+                context: context,
+                snapshot: snapshot,
+                relationship: fallback,
+                action: action
+            )
+            return
+        }
+        let provider = ExternalHelperProvider(
+            executableURL: helperURL,
+            approvedIdentity: approvedIdentity
+        )
         let historyStartedAt = RewritePerformanceTrace.timestamp()
-        Task { [weak self] in
+        let cacheKey = "\(snapshot.applicationIdentifier)|\(snapshot.normalizedTitle ?? "")"
+        guard let requestID = rewriteCoordinator.currentRequestID else { return }
+        let historyTask = Task { [weak self] in
             guard let self else { return }
             do {
+                if action == .expand,
+                   let cached = await self.recentContextCache.context(for: cacheKey) {
+                    guard await self.textIOService.isCurrent(context) else {
+                        throw TextEditingError.textChangedWhileWaiting
+                    }
+                    try await MainActor.run {
+                        guard self.rewriteCoordinator.isCurrent(requestID) else {
+                            throw CancellationError()
+                        }
+                        guard self.conversationResolver.matchesCurrentConversation(snapshot) else {
+                            throw ConversationContextError.changed
+                        }
+                        let resolved = fallback
+                            ?? self.model.intelligence.createInferredRelationship(for: snapshot)
+                        self.beginPolish(
+                            context: context,
+                            snapshot: snapshot,
+                            relationship: resolved,
+                            progressAlreadyShown: true,
+                            action: action,
+                            recentContext: cached
+                        )
+                    }
+                    return
+                }
+
                 _ = try await provider.capabilities()
                 let session = try await provider.resolveSession(for: snapshot)
                 let messages = try await provider.history(
                     conversationID: session.id,
-                    limit: 200,
-                    days: 30
+                    limit: refreshRelationship ? 200 : 30,
+                    days: refreshRelationship ? 30 : 7
                 )
-                let analysis = RelationshipAnalyzer.analyze(
-                    title: snapshot.title,
-                    messages: messages
-                )
+                let analysisBundle = await Task.detached(priority: .userInitiated) {
+                    let recentContext = action == .expand
+                        ? RecentConversationAnalyzer.analyze(messages: messages)
+                        : .empty
+                    let relationship = refreshRelationship
+                        ? RelationshipAnalyzer.analyze(
+                            title: snapshot.title,
+                            messages: messages
+                        )
+                        : nil
+                    return (recentContext, relationship)
+                }.value
+                let recentContext = analysisBundle.0
+                if action == .expand {
+                    await self.recentContextCache.save(recentContext, for: cacheKey)
+                }
+                let analysis = analysisBundle.1
+                guard await self.textIOService.isCurrent(context) else {
+                    throw TextEditingError.textChangedWhileWaiting
+                }
                 self.activePerformanceTrace?.record(
                     .historyContext,
                     since: historyStartedAt
                 )
                 try await MainActor.run {
+                    guard self.rewriteCoordinator.isCurrent(requestID) else {
+                        throw CancellationError()
+                    }
                     guard self.conversationResolver.matchesCurrentConversation(snapshot) else {
                         throw ConversationContextError.changed
                     }
-                    guard self.textService.isCurrent(context) else {
-                        throw TextEditingError.textChangedWhileWaiting
-                    }
                     self.model.helperStatusText = "已连接 · \(session.type)"
-                    let resolved = self.model.intelligence.applyAnalysis(
-                        analysis,
-                        snapshot: snapshot,
-                        conversationID: session.id,
-                        messages: messages
-                    ) ?? fallback
-                    if let resolved {
-                        self.beginPolish(
-                            context: context,
+                    var resolved = fallback
+                    if let analysis {
+                        resolved = self.model.intelligence.applyAnalysis(
+                            analysis,
                             snapshot: snapshot,
-                            relationship: resolved,
-                            progressAlreadyShown: true
-                        )
-                    } else {
-                        self.inputProgressIndicator.fail()
-                        self.model.isProcessing = false
-                        self.requestRelationshipOrUseGeneric(context: context, snapshot: snapshot)
+                            conversationID: session.id,
+                            messages: messages
+                        ) ?? fallback
                     }
+                    resolved = resolved
+                        ?? self.model.intelligence.createInferredRelationship(for: snapshot)
+                    self.beginPolish(
+                        context: context,
+                        snapshot: snapshot,
+                        relationship: resolved,
+                        progressAlreadyShown: true,
+                        action: action,
+                        recentContext: recentContext
+                    )
                 }
             } catch {
                 await MainActor.run {
+                    if error is CancellationError
+                        || !self.rewriteCoordinator.isCurrent(requestID) {
+                        return
+                    }
                     self.activePerformanceTrace?.record(
                         .historyContext,
                         since: historyStartedAt
@@ -547,23 +701,30 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                             context: context,
                             snapshot: snapshot,
                             relationship: fallback,
-                            progressAlreadyShown: true
+                            progressAlreadyShown: true,
+                            action: action
                         )
                     } else if let inferred = self.model.intelligence.createInferredRelationship(for: snapshot) {
                         self.beginPolish(
                             context: context,
                             snapshot: snapshot,
                             relationship: inferred,
-                            progressAlreadyShown: true
+                            progressAlreadyShown: true,
+                            action: action
                         )
                     } else {
                         self.inputProgressIndicator.fail()
                         self.model.isProcessing = false
-                        self.requestRelationshipOrUseGeneric(context: context, snapshot: snapshot)
+                        self.requestRelationshipOrUseGeneric(
+                            context: context,
+                            snapshot: snapshot,
+                            action: action
+                        )
                     }
                 }
             }
         }
+        rewriteCoordinator.attach(historyTask, to: requestID)
     }
 
     private func requestRelationshipOrUseGeneric(
@@ -587,7 +748,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         snapshot: ConversationSnapshot?,
         relationship: RelationshipProfile?,
         progressAlreadyShown: Bool = false,
-        action: RewriteAction = .polish
+        action: RewriteAction = .polish,
+        recentContext: RecentConversationContext = .empty
     ) {
         let voiceMetrics = model.intelligence.voice.metrics(for: relationship?.id)
         let intent = CommunicationIntentAnalyzer.infer(from: context.sourceText)
@@ -618,6 +780,13 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                 applicationRole: applicationContext.role
             )
             : nil
+        let expansionPlan = action == .expand
+            ? ContextualExpansionPlanner.plan(
+                sourceText: context.sourceText,
+                communicationContext: communicationContext,
+                recentContext: recentContext
+            )
+            : nil
         beginRewrite(
             context: context,
             action: action,
@@ -626,12 +795,14 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                 for: snapshot,
                 sourceText: context.sourceText,
                 conversationInstruction: policy.modelInstruction,
-                adaptivePolishPlan: adaptivePolishPlan
+                adaptivePolishPlan: adaptivePolishPlan,
+                expansionPlan: expansionPlan
             ),
             conversationSnapshot: snapshot,
             communicationContext: communicationContext,
             progressAlreadyShown: progressAlreadyShown,
-            adaptivePolishPlan: adaptivePolishPlan
+            adaptivePolishPlan: adaptivePolishPlan,
+            expansionPlan: expansionPlan
         )
     }
 
@@ -640,7 +811,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         for snapshot: ConversationSnapshot?,
         sourceText: String,
         conversationInstruction: String? = nil,
-        adaptivePolishPlan: AdaptivePolishPlan? = nil
+        adaptivePolishPlan: AdaptivePolishPlan? = nil,
+        expansionPlan: ContextualExpansionPlan? = nil
     ) -> String {
         let applicationInstruction = snapshot.flatMap {
             ApplicationContextPolicy.contextInstruction(
@@ -667,8 +839,14 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                 adaptivePlan: adaptivePolishPlan
             )
         case .expand:
+            let expansionContext = [
+                contextInstruction.isEmpty ? nil : contextInstruction,
+                expansionPlan?.modelInstruction
+            ]
+                .compactMap { $0 }
+                .joined(separator: "\n\n")
             return PromptPolicy.expansionPrompt(
-                contextInstruction: contextInstruction.isEmpty ? nil : contextInstruction
+                contextInstruction: expansionContext.isEmpty ? nil : expansionContext
             )
         case .translate:
             return TranslationPolicy.prompt
@@ -712,31 +890,33 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
 
         conversationResolver.reactivate(snapshot)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-            guard let self, self.model.isProcessing else { return }
-            guard self.conversationResolver.matchesCurrentConversation(snapshot) else {
-                self.cancelForChangedConversation()
-                return
-            }
-            guard self.textService.isCurrent(context) else {
-                self.cancelForChangedText()
-                return
-            }
-
-            switch decision {
-            case .save(let role, let instruction):
-                guard let profile = self.model.intelligence.createManualRelationship(
-                    for: snapshot,
-                    role: role,
-                    customInstruction: instruction
-                ) else {
+            Task { @MainActor [weak self] in
+                guard let self, self.model.isProcessing else { return }
+                guard self.conversationResolver.matchesCurrentConversation(snapshot) else {
                     self.cancelForChangedConversation()
                     return
                 }
-                self.beginPolish(context: context, snapshot: snapshot, relationship: profile)
-            case .useGeneric:
-                self.beginPolish(context: context, snapshot: snapshot, relationship: nil)
-            case .cancel:
-                self.resetAfterCancelledConversationSelection()
+                guard await self.textIOService.isCurrent(context) else {
+                    self.cancelForChangedText()
+                    return
+                }
+
+                switch decision {
+                case .save(let role, let instruction):
+                    guard let profile = self.model.intelligence.createManualRelationship(
+                        for: snapshot,
+                        role: role,
+                        customInstruction: instruction
+                    ) else {
+                        self.cancelForChangedConversation()
+                        return
+                    }
+                    self.beginPolish(context: context, snapshot: snapshot, relationship: profile)
+                case .useGeneric:
+                    self.beginPolish(context: context, snapshot: snapshot, relationship: nil)
+                case .cancel:
+                    self.resetAfterCancelledConversationSelection()
+                }
             }
         }
     }
@@ -748,7 +928,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         conversationSnapshot: ConversationSnapshot?,
         communicationContext: CommunicationContext?,
         progressAlreadyShown: Bool = false,
-        adaptivePolishPlan: AdaptivePolishPlan? = nil
+        adaptivePolishPlan: AdaptivePolishPlan? = nil,
+        expansionPlan: ContextualExpansionPlan? = nil
     ) {
         model.isProcessing = true
         model.statusText = adaptivePolishPlan?.progressDescription
@@ -783,7 +964,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         let key = model.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let selectedModel = model.modelName
 
-        Task { [weak self] in
+        guard let requestID = rewriteCoordinator.currentRequestID else { return }
+        let rewriteTask = Task { [weak self] in
             guard let self else { return }
             let attemptState = RewriteAttemptState()
             do {
@@ -793,7 +975,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                     let lengthBudget: RewriteLengthBudget?
                     switch rewriteMode {
                     case .expand:
-                        lengthBudget = .expansion
+                        lengthBudget = expansionPlan?.lengthBudget ?? .expansion
                     case .polish:
                         lengthBudget = adaptivePolishPlan?.lengthBudget
                     }
@@ -808,57 +990,36 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         )
                     )
                     let firstGuardStartedAt = RewritePerformanceTrace.timestamp()
-                    let firstFactAudit = FactGuard.audit(
+                    let firstAudit = await self.rewritePipeline.audit(
                         sourceText: context.sourceText,
                         result: first,
                         applicationRole: communicationContext.applicationContext.role,
                         expansionRatio: communicationContext.policy.messageExpansionRatio,
                         semanticLibraries: self.model.enabledSemanticLibraries,
-                        lengthBudget: lengthBudget
-                    )
-                    let firstVoiceAudit = VoiceGuard.audit(
-                        sourceText: context.sourceText,
-                        outputText: first.rewrittenText,
                         expectedVoice: communicationContext.policy.voice,
-                        applicationRole: communicationContext.applicationContext.role
-                    )
-                    let firstAlignmentAudit = RewriteAlignmentGuard.audit(
-                        sourceText: context.sourceText,
-                        outputText: first.rewrittenText,
-                        applicationRole: communicationContext.applicationContext.role,
                         rewriteMode: rewriteMode,
-                        lengthBudget: lengthBudget
-                    )
-                    let firstQualityAudit = RewriteQualityGuard.audit(
-                        sourceText: context.sourceText,
-                        outputText: first.rewrittenText,
-                        applicationRole: communicationContext.applicationContext.role,
-                        rewriteMode: rewriteMode,
-                        lengthBudget: lengthBudget
+                        lengthBudget: lengthBudget,
+                        expansionPlan: expansionPlan
                     )
                     self.activePerformanceTrace?.record(
                         .firstGuard,
                         since: firstGuardStartedAt
                     )
-                    let firstWasSafe = firstFactAudit.accepted
-                        && firstVoiceAudit.accepted
-                        && firstAlignmentAudit.accepted
-                    let firstWasAccepted = firstWasSafe && firstQualityAudit.accepted
+                    let firstWasSafe = firstAudit.isSafe
+                    let firstWasQualityAccepted = firstAudit.isQualityAccepted
+                    let firstWasAccepted = firstWasSafe && firstWasQualityAccepted
                     if firstWasAccepted {
                         result = first.rewrittenText
                     } else {
                         attemptState.retried = true
-                        if !firstWasSafe, !firstQualityAudit.accepted {
+                        if !firstWasSafe, !firstWasQualityAccepted {
                             attemptState.retryReason = "safety_and_quality"
                         } else if !firstWasSafe {
                             attemptState.retryReason = "safety"
                         } else {
                             attemptState.retryReason = "quality"
                         }
-                        let issues = firstFactAudit.issues
-                            + firstVoiceAudit.issues
-                            + firstAlignmentAudit.issues
-                            + firstQualityAudit.issues
+                        let issues = firstAudit.issues
                         let retry = StructuredRewriteResult(
                             rewrittenText: try await self.requestOptimization(
                                 text: context.sourceText,
@@ -870,61 +1031,44 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                             )
                         )
                         let retryGuardStartedAt = RewritePerformanceTrace.timestamp()
-                        let retryFactAudit = FactGuard.audit(
+                        let retryAudit = await self.rewritePipeline.audit(
                             sourceText: context.sourceText,
                             result: retry,
                             applicationRole: communicationContext.applicationContext.role,
                             expansionRatio: communicationContext.policy.messageExpansionRatio,
                             semanticLibraries: self.model.enabledSemanticLibraries,
-                            lengthBudget: lengthBudget
-                        )
-                        let retryVoiceAudit = VoiceGuard.audit(
-                            sourceText: context.sourceText,
-                            outputText: retry.rewrittenText,
                             expectedVoice: communicationContext.policy.voice,
-                            applicationRole: communicationContext.applicationContext.role
-                        )
-                        let retryAlignmentAudit = RewriteAlignmentGuard.audit(
-                            sourceText: context.sourceText,
-                            outputText: retry.rewrittenText,
-                            applicationRole: communicationContext.applicationContext.role,
                             rewriteMode: rewriteMode,
-                            lengthBudget: lengthBudget
-                        )
-                        let retryQualityAudit = RewriteQualityGuard.audit(
-                            sourceText: context.sourceText,
-                            outputText: retry.rewrittenText,
-                            applicationRole: communicationContext.applicationContext.role,
-                            rewriteMode: rewriteMode,
-                            lengthBudget: lengthBudget
+                            lengthBudget: lengthBudget,
+                            expansionPlan: expansionPlan
                         )
                         self.activePerformanceTrace?.record(
                             .retryGuard,
                             since: retryGuardStartedAt
                         )
-                        if retryFactAudit.accepted,
-                           retryVoiceAudit.accepted,
-                           retryAlignmentAudit.accepted,
-                           retryQualityAudit.accepted {
+                        if retryAudit.isSafe, retryAudit.isQualityAccepted {
                             result = retry.rewrittenText
                         } else if firstWasSafe,
-                                  !firstQualityAudit.meaningfullyChanged {
+                                  !firstAudit.quality.meaningfullyChanged {
                             // If both attempts fail to produce a safe improvement,
                             // preserving the user's original text is the only honest
                             // fallback. It remains classified as unchanged rather than
                             // being presented as a successful rewrite.
                             result = first.rewrittenText
                         } else {
-                            let retrySafetyIssues = retryFactAudit.issues
-                                + retryVoiceAudit.issues
-                                + retryAlignmentAudit.issues
+                            let retrySafetyIssues = retryAudit.fact.issues
+                                + retryAudit.voice.issues
+                                + retryAudit.alignment.issues
                             if retrySafetyIssues.isEmpty {
                                 throw RewriteSafetyError.qualityRejected(
-                                    retryQualityAudit.issues
+                                    retryAudit.quality.issues
+                                        + (retryAudit.contextual?.issues ?? [])
                                 )
                             }
                             throw RewriteSafetyError.rejected(
-                                retrySafetyIssues + retryQualityAudit.issues
+                                retrySafetyIssues
+                                    + retryAudit.quality.issues
+                                    + (retryAudit.contextual?.issues ?? [])
                             )
                         }
                     }
@@ -938,17 +1082,28 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         stage: .firstModel
                     )
                 }
+                let writebackStartedAt = RewritePerformanceTrace.timestamp()
                 try await MainActor.run {
-                    let writebackStartedAt = RewritePerformanceTrace.timestamp()
+                    guard self.rewriteCoordinator.isCurrent(requestID) else {
+                        throw CancellationError()
+                    }
                     if let conversationSnapshot,
                        !self.conversationResolver.matchesCurrentConversation(conversationSnapshot) {
                         throw ConversationContextError.changed
+                    }
+                    guard self.rewriteCoordinator.prepareForCommit(requestID) else {
+                        throw CancellationError()
+                    }
+                }
+                try await self.textIOService.replace(context: context, with: result)
+                try await MainActor.run {
+                    guard self.rewriteCoordinator.isCurrent(requestID) else {
+                        throw CancellationError()
                     }
                     let outcome = OptimizationOutcome.classify(
                         sourceText: context.sourceText,
                         result: result
                     )
-                    try self.textService.replace(context: context, with: result)
                     if action == .polish {
                         let relationshipID = communicationContext?.relationship?.id
                         let historyEntryID: UUID?
@@ -992,6 +1147,10 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                 }
             } catch {
                 await MainActor.run {
+                    if error is CancellationError
+                        || !self.rewriteCoordinator.isCurrent(requestID) {
+                        return
+                    }
                     NSObject.cancelPreviousPerformRequests(
                         withTarget: self,
                         selector: #selector(self.finishPendingCompletion),
@@ -1005,6 +1164,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         self.model.markAPIKeyInvalid(qwenError.localizedDescription)
                     }
                     self.model.statusText = self.failureStatusText(for: error)
+                    self.rewriteCoordinator.finish(requestID)
                     self.activePerformanceTrace?.finish(
                         outcome: "failed",
                         retried: attemptState.retried,
@@ -1014,6 +1174,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                 }
             }
         }
+        rewriteCoordinator.attach(rewriteTask, to: requestID)
     }
 
     private func requestOptimization(
@@ -1085,26 +1246,44 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         progressPositionRetryWorkItem = nil
         activePerformanceTrace?.finish(outcome: "cancelled", retried: false)
         activePerformanceTrace = nil
+        rewriteCoordinator.finish()
         model.isProcessing = false
         model.statusText = model.isEnabled ? readyStatusText : "已暂停"
     }
 
     private func cancelForChangedConversation() {
-        progressPositionRetryWorkItem?.cancel()
-        progressPositionRetryWorkItem = nil
-        activePerformanceTrace?.finish(outcome: "conversation_changed", retried: false)
-        activePerformanceTrace = nil
-        model.isProcessing = false
-        model.statusText = ConversationContextError.changed.localizedDescription
+        if rewriteCoordinator.hasActiveRequest {
+            rewriteCoordinator.cancel(.targetChanged)
+        } else {
+            handleAutomaticCancellation(.targetChanged)
+        }
     }
 
     private func cancelForChangedText() {
+        if rewriteCoordinator.hasActiveRequest {
+            rewriteCoordinator.cancel(.textChanged)
+        } else {
+            handleAutomaticCancellation(.textChanged)
+        }
+    }
+
+    private func handleAutomaticCancellation(_ reason: RewriteCancellationReason) {
+        NSObject.cancelPreviousPerformRequests(
+            withTarget: self,
+            selector: #selector(finishPendingCompletion),
+            object: nil
+        )
+        pendingCompletion = nil
         progressPositionRetryWorkItem?.cancel()
         progressPositionRetryWorkItem = nil
-        activePerformanceTrace?.finish(outcome: "text_changed", retried: false)
+        inputProgressIndicator.fail()
+        activePerformanceTrace?.finish(
+            outcome: reason.performanceOutcome,
+            retried: false
+        )
         activePerformanceTrace = nil
         model.isProcessing = false
-        model.statusText = TextEditingError.textChangedWhileWaiting.localizedDescription
+        model.statusText = reason.statusText
     }
 
     @objc private func finishPendingCompletion() {
@@ -1130,6 +1309,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                 retryReason: completion.retryReason
             )
             self.activePerformanceTrace = nil
+            self.rewriteCoordinator.finish()
             self.model.isProcessing = false
             self.model.statusText = self.model.isEnabled ? self.readyStatusText : "已暂停"
         }

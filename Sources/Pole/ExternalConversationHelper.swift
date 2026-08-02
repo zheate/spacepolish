@@ -42,6 +42,7 @@ enum ConversationHelperError: LocalizedError, Equatable {
     case unavailable(String)
     case ambiguousSession
     case noMatchingSession
+    case helperIdentity(HelperIdentityError)
 
     var errorDescription: String? {
         switch self {
@@ -52,10 +53,11 @@ enum ConversationHelperError: LocalizedError, Equatable {
         case .nonzeroExit(let code, let message): return "helper 退出（\(code)）：\(message)"
         case .invalidJSON: return "helper 返回了无效 JSON"
         case .incompatibleProtocol(let version): return "不支持 helper 协议版本 \(version)"
-        case .notReadOnly: return "Pole 只接受声明为只读的 helper"
+        case .notReadOnly: return "helper 未声明只读，Pole 已拒绝运行"
         case .unavailable(let message): return "helper 当前不可用：\(message)"
         case .ambiguousSession: return "找到多个同名会话，需要用户确认"
         case .noMatchingSession: return "helper 中没有找到当前会话"
+        case .helperIdentity(let error): return error.localizedDescription
         }
     }
 }
@@ -78,15 +80,25 @@ struct ExternalHelperProvider: ConversationHistoryProvider {
 
     let executableURL: URL
     private let runner: HelperProcessRunner
+    private let approvedIdentity: HelperIdentity?
+    private let identityService: HelperIdentityService
 
-    init(executableURL: URL, runner: HelperProcessRunner = HelperProcessRunner()) {
+    init(
+        executableURL: URL,
+        approvedIdentity: HelperIdentity? = nil,
+        runner: HelperProcessRunner = HelperProcessRunner(),
+        identityService: HelperIdentityService = HelperIdentityService()
+    ) {
         self.executableURL = executableURL
+        self.approvedIdentity = approvedIdentity
         self.runner = runner
+        self.identityService = identityService
     }
 
     func capabilities() async throws -> HelperCapabilities {
         let scopedAccess = executableURL.startAccessingSecurityScopedResource()
         defer { if scopedAccess { executableURL.stopAccessingSecurityScopedResource() } }
+        try await validateApprovedIdentityIfNeeded()
         let data = try await runner.run(
             executableURL: executableURL,
             arguments: ["capabilities", "--json"],
@@ -106,6 +118,7 @@ struct ExternalHelperProvider: ConversationHistoryProvider {
         let clampedLimit = max(1, min(limit, 200))
         let scopedAccess = executableURL.startAccessingSecurityScopedResource()
         defer { if scopedAccess { executableURL.stopAccessingSecurityScopedResource() } }
+        try await validateApprovedIdentityIfNeeded()
         let data = try await runner.run(
             executableURL: executableURL,
             arguments: ["sessions", "--limit", String(clampedLimit), "--json"],
@@ -127,6 +140,7 @@ struct ExternalHelperProvider: ConversationHistoryProvider {
         let clampedDays = max(1, min(days, 365))
         let scopedAccess = executableURL.startAccessingSecurityScopedResource()
         defer { if scopedAccess { executableURL.stopAccessingSecurityScopedResource() } }
+        try await validateApprovedIdentityIfNeeded()
         let data = try await runner.run(
             executableURL: executableURL,
             arguments: [
@@ -167,6 +181,19 @@ struct ExternalHelperProvider: ConversationHistoryProvider {
         }
     }
 
+    private func validateApprovedIdentityIfNeeded() async throws {
+        guard let approvedIdentity else { return }
+        let current: HelperIdentity
+        do {
+            current = try await identityService.inspect(executableURL)
+        } catch let error as HelperIdentityError {
+            throw ConversationHelperError.helperIdentity(error)
+        }
+        guard current.sha256 == approvedIdentity.sha256 else {
+            throw ConversationHelperError.helperIdentity(.changed)
+        }
+    }
+
     private func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .custom { valueDecoder in
@@ -199,22 +226,30 @@ struct HelperProcessRunner {
         timeout: TimeInterval,
         maximumOutputBytes: Int
     ) async throws -> Data {
-        try await Task.detached(priority: .userInitiated) {
-            try runSynchronously(
-                executableURL: executableURL,
-                arguments: arguments,
-                timeout: timeout,
-                maximumOutputBytes: maximumOutputBytes
-            )
-        }.value
+        let controller = HelperProcessController()
+        return try await withTaskCancellationHandler {
+            try await Task.detached(priority: .userInitiated) {
+                try runSynchronously(
+                    executableURL: executableURL,
+                    arguments: arguments,
+                    timeout: timeout,
+                    maximumOutputBytes: maximumOutputBytes,
+                    controller: controller
+                )
+            }.value
+        } onCancel: {
+            controller.cancel()
+        }
     }
 
     private func runSynchronously(
         executableURL: URL,
         arguments: [String],
         timeout: TimeInterval,
-        maximumOutputBytes: Int
+        maximumOutputBytes: Int,
+        controller: HelperProcessController
     ) throws -> Data {
+        if controller.isCancelled { throw CancellationError() }
         guard FileManager.default.isExecutableFile(atPath: executableURL.path) else {
             throw ConversationHelperError.missingExecutable
         }
@@ -238,6 +273,7 @@ struct HelperProcessRunner {
 
         do {
             try process.run()
+            controller.attach(process)
         } catch {
             throw ConversationHelperError.launchFailed(error.localizedDescription)
         }
@@ -286,6 +322,7 @@ struct HelperProcessRunner {
             if process.isRunning { kill(process.processIdentifier, SIGKILL) }
         }
         process.waitUntilExit()
+        controller.detach(process)
         if readers.wait(timeout: .now() + 1) == .timedOut {
             try? outputPipe.fileHandleForReading.close()
             try? errorPipe.fileHandleForReading.close()
@@ -297,6 +334,7 @@ struct HelperProcessRunner {
         let didExceedLimit = exceededLimit || output.count > maximumOutputBytes
         lock.unlock()
 
+        if controller.isCancelled { throw CancellationError() }
         if didExceedLimit { throw ConversationHelperError.outputTooLarge }
         if didTimeOut { throw ConversationHelperError.timedOut }
         guard process.terminationStatus == 0 else {
@@ -305,5 +343,39 @@ struct HelperProcessRunner {
             throw ConversationHelperError.nonzeroExit(process.terminationStatus, message)
         }
         return finalOutput
+    }
+}
+
+private final class HelperProcessController: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func attach(_ process: Process) {
+        lock.lock()
+        self.process = process
+        let shouldTerminate = cancelled
+        lock.unlock()
+        if shouldTerminate, process.isRunning { process.terminate() }
+    }
+
+    func detach(_ process: Process) {
+        lock.lock()
+        if self.process === process { self.process = nil }
+        lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let process = self.process
+        lock.unlock()
+        if let process, process.isRunning { process.terminate() }
     }
 }

@@ -108,3 +108,59 @@ enum ExpansionQualityCorpus {
         .init("expand-short-02", .casual, "收到", requiresImprovement: false)
     ]
 }
+
+struct ContextualExpansionSample {
+    let id: String
+    let sourceText: String
+    let questionType: RecentQuestionType
+    let relationshipRole: ConversationRole?
+    let forbiddenPhrases: [String]
+    let requiresVisibleExpansion: Bool
+}
+
+enum ContextualExpansionCorpus {
+    // Only abstract context labels are retained. No historical chat body is
+    // persisted or sent to the model as part of these fixtures.
+    static let core: [ContextualExpansionSample] = [
+        .init(
+            id: "context-feasibility-customer",
+            sourceText: "这个指标还不能确认，需要验证。",
+            questionType: .feasibility,
+            relationshipRole: .customer,
+            forbiddenPhrases: ["明天", "保证", "确保", "按时"],
+            requiresVisibleExpansion: true
+        ),
+        .init(
+            id: "context-status-customer",
+            sourceText: "材料还没到，交期不能确定。",
+            questionType: .status,
+            relationshipRole: .customer,
+            forbiddenPhrases: ["积极协调", "持续跟进", "尽快到位"],
+            requiresVisibleExpansion: true
+        ),
+        .init(
+            id: "context-timing-colleague",
+            sourceText: "还需要再测试。",
+            questionType: .timing,
+            relationshipRole: .colleague,
+            forbiddenPhrases: ["明天", "本周", "预计", "两天"],
+            requiresVisibleExpansion: false
+        ),
+        .init(
+            id: "context-short-noop",
+            sourceText: "好的",
+            questionType: .confirmation,
+            relationshipRole: .colleague,
+            forbiddenPhrases: ["收到", "没问题", "会处理"],
+            requiresVisibleExpansion: false
+        ),
+        .init(
+            id: "context-no-commitment",
+            sourceText: "交期可能受材料影响。",
+            questionType: .status,
+            relationshipRole: .customer,
+            forbiddenPhrases: ["确保", "按时交付", "积极协调", "持续跟进"],
+            requiresVisibleExpansion: false
+        )
+    ]
+}

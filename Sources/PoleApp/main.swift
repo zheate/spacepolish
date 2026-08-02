@@ -1,0 +1,3 @@
+import PolePlatform
+
+runPoleApplication()

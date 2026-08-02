@@ -8,11 +8,12 @@ let package = Package(
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "Pole", targets: ["Pole"])
+        .executable(name: "Pole", targets: ["Pole"]),
+        .executable(name: "PoleQualityEvaluation", targets: ["PoleQualityEvaluation"])
     ],
     targets: [
-        .executableTarget(
-            name: "Pole",
+        .target(
+            name: "PoleCore",
             path: "Sources/Pole",
             linkerSettings: [
                 .linkedFramework("AppKit"),
@@ -20,6 +21,30 @@ let package = Package(
                 .linkedFramework("Vision"),
                 .linkedFramework("Security")
             ]
+        ),
+        .target(
+            name: "PolePlatform",
+            dependencies: ["PoleCore"],
+            path: "Sources/PolePlatform"
+        ),
+        .executableTarget(
+            name: "Pole",
+            dependencies: ["PolePlatform"],
+            path: "Sources/PoleApp"
+        ),
+        .executableTarget(
+            name: "PoleQualityEvaluation",
+            dependencies: ["PoleCore"],
+            path: "Checks",
+            exclude: ["main.swift", "PoleRegressionTests.swift"],
+            sources: ["QualityEvaluationMain.swift"]
+        ),
+        .testTarget(
+            name: "PoleCoreTests",
+            dependencies: ["PoleCore"],
+            path: "Checks",
+            exclude: ["QualityEvaluationMain.swift"],
+            sources: ["main.swift", "PoleRegressionTests.swift"]
         )
     ]
 )

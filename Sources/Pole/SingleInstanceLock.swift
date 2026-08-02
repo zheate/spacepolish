@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 
-final class SingleInstanceLock {
+package final class SingleInstanceLock {
     private var descriptor: Int32
     let fileURL: URL
 
@@ -10,7 +10,7 @@ final class SingleInstanceLock {
         self.fileURL = fileURL
     }
 
-    static func acquire(
+    package static func acquire(
         fileURL: URL = FileManager.default.temporaryDirectory
             .appendingPathComponent("com.spacepolish.mac.instance.lock")
     ) -> SingleInstanceLock? {
@@ -27,7 +27,7 @@ final class SingleInstanceLock {
         return SingleInstanceLock(descriptor: descriptor, fileURL: fileURL)
     }
 
-    func release() {
+    package func release() {
         guard descriptor >= 0 else { return }
         flock(descriptor, LOCK_UN)
         close(descriptor)
