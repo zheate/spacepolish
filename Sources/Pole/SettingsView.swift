@@ -1,12 +1,24 @@
 import AppKit
 
-final class SettingsWindowController: NSWindowController {
+final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private let model: AppModel
+    private let onValidateAPIKey: (String) async throws -> Void
     private let onSave: () -> Void
     private let onRequestPermission: () -> Void
     private let onRequestScreenCapturePermission: () -> Void
 
     private let apiKeyField = NSSecureTextField()
+    private let apiKeyStatusLabel = NSTextField(labelWithString: "")
+    private lazy var validateAPIKeyButton = NSButton(
+        title: "验证连接",
+        target: self,
+        action: #selector(validateAPIKeyClicked)
+    )
+    private lazy var saveButton = NSButton(
+        title: "保存",
+        target: self,
+        action: #selector(saveClicked)
+    )
     private let modelPicker = NSPopUpButton()
     private let promptTextView = NSTextView()
     private let intervalSlider = NSSlider(value: 1.2, minValue: 0.5, maxValue: 2.0, target: nil, action: nil)
@@ -37,14 +49,18 @@ final class SettingsWindowController: NSWindowController {
     private let voiceSummaryLabel = NSTextField(wrappingLabelWithString: "尚未建立用户声音画像")
     private let conversationProfilesView: ConversationProfilesSettingsView
     private let rewriteHistoryView: RewriteHistorySettingsView
+    private var lastValidatedAPIKey: String?
+    private var apiKeyWasEdited = false
 
     init(
         model: AppModel,
+        onValidateAPIKey: @escaping (String) async throws -> Void,
         onSave: @escaping () -> Void,
         onRequestPermission: @escaping () -> Void,
         onRequestScreenCapturePermission: @escaping () -> Void
     ) {
         self.model = model
+        self.onValidateAPIKey = onValidateAPIKey
         self.onSave = onSave
         self.onRequestPermission = onRequestPermission
         self.onRequestScreenCapturePermission = onRequestScreenCapturePermission
@@ -52,7 +68,7 @@ final class SettingsWindowController: NSWindowController {
         self.rewriteHistoryView = RewriteHistorySettingsView(store: model.intelligence)
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 700, height: 660),
+            contentRect: NSRect(x: 0, y: 0, width: 700, height: 680),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -79,11 +95,15 @@ final class SettingsWindowController: NSWindowController {
         window?.makeKeyAndOrderFront(nil)
     }
 
+    func refreshAPIConnectionState() {
+        updateAPIKeyStatus()
+    }
+
     private func buildContentView() -> NSView {
         let root = NSView()
         let title = NSTextField(labelWithString: "Pole")
         title.font = .systemFont(ofSize: 24, weight: .semibold)
-        let subtitle = NSTextField(labelWithString: "你的本地优先沟通增强层")
+        let subtitle = NSTextField(labelWithString: "本地控制，云端改写")
         subtitle.textColor = .secondaryLabelColor
         let header = verticalStack([title, subtitle], spacing: 3)
 
@@ -97,7 +117,6 @@ final class SettingsWindowController: NSWindowController {
         tabs.addTabViewItem(tabItem(label: "隐私", view: buildPrivacyTab()))
 
         let permissionButton = NSButton(title: "去授权 / 刷新", target: self, action: #selector(permissionClicked))
-        let saveButton = NSButton(title: "保存", target: self, action: #selector(saveClicked))
         saveButton.keyEquivalent = "\r"
         saveButton.bezelStyle = .rounded
         let footer = horizontalStack(
@@ -118,7 +137,7 @@ final class SettingsWindowController: NSWindowController {
             stack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -18),
             header.widthAnchor.constraint(equalTo: stack.widthAnchor),
             tabs.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            tabs.heightAnchor.constraint(equalToConstant: 510),
+            tabs.heightAnchor.constraint(equalToConstant: 526),
             footer.widthAnchor.constraint(equalTo: stack.widthAnchor)
         ])
         return root
@@ -130,17 +149,24 @@ final class SettingsWindowController: NSWindowController {
         apiLabel.font = .systemFont(ofSize: 13, weight: .medium)
         apiKeyField.placeholderString = "sk-..."
         apiKeyField.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        apiKeyField.delegate = self
+        apiKeyStatusLabel.font = .systemFont(ofSize: 11)
         let keyButton = NSButton(title: "获取 API Key", target: self, action: #selector(openAPIKeyPage))
         keyButton.bezelStyle = .inline
+        validateAPIKeyButton.bezelStyle = .inline
         modelPicker.addItems(withTitles: ["Qwen 3.7 Plus", "Qwen 3.6 Flash"])
         let modelRow = horizontalStack([
-            NSTextField(labelWithString: "模型"), modelPicker, flexibleSpacer(), keyButton
+            NSTextField(labelWithString: "模型"), modelPicker, flexibleSpacer(),
+            validateAPIKeyButton, keyButton
         ], spacing: 10)
         let privacy = secondaryLabel("API Key 只保存在 macOS 钥匙串；当前待处理文本会发送给通义千问。")
         let qwenBox = makeBox(
             title: "通义千问",
-            content: verticalStack([apiLabel, apiKeyField, modelRow, privacy], spacing: 10),
-            height: 162
+            content: verticalStack(
+                [apiLabel, apiKeyField, modelRow, apiKeyStatusLabel, privacy],
+                spacing: 10
+            ),
+            height: 178
         )
 
         promptTextView.font = .systemFont(ofSize: 12)
@@ -410,6 +436,10 @@ final class SettingsWindowController: NSWindowController {
 
     private func loadModelIntoControls() {
         apiKeyField.stringValue = model.apiKey
+        lastValidatedAPIKey = model.apiConnectionState == .valid
+            ? model.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            : nil
+        apiKeyWasEdited = false
         modelPicker.selectItem(at: model.modelName == "qwen3.6-flash" ? 1 : 0)
         promptTextView.string = model.prompt
         intervalSlider.doubleValue = model.triggerInterval
@@ -423,6 +453,8 @@ final class SettingsWindowController: NSWindowController {
         learningCheckbox.state = model.rewriteLearningEnabled ? .on : .off
         helperPathLabel.stringValue = model.helperPath.isEmpty ? "未配置本地 helper" : model.helperPath
         helperStatusLabel.stringValue = model.helperStatusText
+        syncHelperDependentControls()
+        updateAPIKeyStatus()
         updateIntervalLabel()
         updateVoiceSummary()
     }
@@ -470,6 +502,17 @@ final class SettingsWindowController: NSWindowController {
         NSWorkspace.shared.open(url)
     }
 
+    func controlTextDidChange(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField,
+              field === apiKeyField else { return }
+        lastValidatedAPIKey = nil
+        apiKeyWasEdited = true
+        apiKeyStatusLabel.stringValue = apiKeyField.stringValue
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty ? "● 尚未配置" : "● 尚未验证"
+        apiKeyStatusLabel.textColor = .secondaryLabelColor
+    }
+
     @objc private func permissionClicked() {
         AccessibilityPermission.isTrusted ? refreshPermissionState() : onRequestPermission()
     }
@@ -490,6 +533,7 @@ final class SettingsWindowController: NSWindowController {
         helperStatusLabel.stringValue = model.helperPath.isEmpty
             ? model.helperStatusText
             : "待检测；Pole 不会执行安装或提权"
+        syncHelperDependentControls()
     }
 
     @objc private func removeHelper() {
@@ -497,7 +541,7 @@ final class SettingsWindowController: NSWindowController {
         helperPathLabel.stringValue = "未配置本地 helper"
         helperStatusLabel.stringValue = ""
         historyCheckbox.state = .off
-        learningCheckbox.state = .off
+        syncHelperDependentControls()
     }
 
     @objc private func testHelper() {
@@ -512,6 +556,7 @@ final class SettingsWindowController: NSWindowController {
                 await MainActor.run {
                     self?.model.helperStatusText = "已连接 · \(capabilities.provider) · 协议 v\(capabilities.protocolVersion)"
                     self?.helperStatusLabel.stringValue = self?.model.helperStatusText ?? "已连接"
+                    self?.syncHelperDependentControls()
                 }
             } catch {
                 await MainActor.run {
@@ -546,9 +591,81 @@ final class SettingsWindowController: NSWindowController {
         updateVoiceSummary()
     }
 
+    @objc private func validateAPIKeyClicked() {
+        validateAPIKey(saveAfterValidation: false)
+    }
+
     @objc private func saveClicked() {
-        model.apiKey = apiKeyField.stringValue
-        model.modelName = modelPicker.indexOfSelectedItem == 1 ? "qwen3.6-flash" : "qwen3.7-plus"
+        validateAPIKey(saveAfterValidation: true)
+    }
+
+    private func validateAPIKey(saveAfterValidation: Bool) {
+        let key = apiKeyField.stringValue
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if key.isEmpty {
+            if saveAfterValidation {
+                applyControlsToModel(apiKey: "")
+                model.markAPIKeyUnknown()
+                apiKeyWasEdited = false
+                onSave()
+                updateAPIKeyStatus()
+            } else {
+                apiKeyStatusLabel.stringValue = "● 请先填写 API Key"
+                apiKeyStatusLabel.textColor = .systemOrange
+            }
+            return
+        }
+
+        if saveAfterValidation,
+           key == lastValidatedAPIKey {
+            applyControlsToModel(apiKey: key)
+            model.markAPIKeyValid()
+            apiKeyWasEdited = false
+            onSave()
+            return
+        }
+        if saveAfterValidation,
+           !apiKeyWasEdited,
+           key == model.apiKey.trimmingCharacters(in: .whitespacesAndNewlines) {
+            applyControlsToModel(apiKey: key)
+            onSave()
+            return
+        }
+
+        setAPIValidationBusy(true)
+        apiKeyStatusLabel.stringValue = "● 正在验证连接…"
+        apiKeyStatusLabel.textColor = .systemBlue
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.onValidateAPIKey(key)
+                self.lastValidatedAPIKey = key
+                self.apiKeyStatusLabel.stringValue = "● 连接有效，可使用所选 Qwen 模型"
+                self.apiKeyStatusLabel.textColor = .systemTeal
+                if saveAfterValidation {
+                    self.applyControlsToModel(apiKey: key)
+                    self.model.markAPIKeyValid()
+                    self.apiKeyWasEdited = false
+                    self.onSave()
+                }
+            } catch {
+                let message = (error as? LocalizedError)?.errorDescription
+                    ?? error.localizedDescription
+                self.apiKeyStatusLabel.stringValue = "● \(message)"
+                self.apiKeyStatusLabel.textColor = .systemRed
+                if key == self.model.apiKey.trimmingCharacters(in: .whitespacesAndNewlines) {
+                    self.model.markAPIKeyInvalid(message)
+                }
+            }
+            self.setAPIValidationBusy(false)
+        }
+    }
+
+    private func applyControlsToModel(apiKey: String) {
+        model.apiKey = apiKey
+        model.modelName = modelPicker.indexOfSelectedItem == 1
+            ? "qwen3.6-flash"
+            : QwenClient.defaultModel
         model.prompt = promptTextView.string
         model.triggerInterval = intervalSlider.doubleValue
         model.soundEffectsEnabled = soundEffectsCheckbox.state == .on
@@ -557,8 +674,44 @@ final class SettingsWindowController: NSWindowController {
                 semanticLibraryCheckboxes[$0]?.state == .on
             }
         )
-        model.historyAnalysisEnabled = historyCheckbox.state == .on
+        model.historyAnalysisEnabled = model.helperURL != nil
+            && historyCheckbox.state == .on
         model.rewriteLearningEnabled = learningCheckbox.state == .on
-        onSave()
+    }
+
+    private func setAPIValidationBusy(_ isBusy: Bool) {
+        apiKeyField.isEnabled = !isBusy
+        validateAPIKeyButton.isEnabled = !isBusy
+        saveButton.isEnabled = !isBusy
+    }
+
+    private func updateAPIKeyStatus() {
+        guard model.hasAPIKey else {
+            apiKeyStatusLabel.stringValue = "● 尚未配置"
+            apiKeyStatusLabel.textColor = .secondaryLabelColor
+            return
+        }
+        switch model.apiConnectionState {
+        case .unknown:
+            apiKeyStatusLabel.stringValue = "● 尚未验证"
+            apiKeyStatusLabel.textColor = .secondaryLabelColor
+        case .checking:
+            apiKeyStatusLabel.stringValue = "● 正在验证连接…"
+            apiKeyStatusLabel.textColor = .systemBlue
+        case .valid:
+            apiKeyStatusLabel.stringValue = "● 连接有效，可使用所选 Qwen 模型"
+            apiKeyStatusLabel.textColor = .systemTeal
+        case .invalid(let message):
+            apiKeyStatusLabel.stringValue = "● \(message)"
+            apiKeyStatusLabel.textColor = .systemRed
+        }
+    }
+
+    private func syncHelperDependentControls() {
+        let hasHelper = model.helperURL != nil
+        historyCheckbox.isEnabled = hasHelper
+        if !hasHelper {
+            historyCheckbox.state = .off
+        }
     }
 }

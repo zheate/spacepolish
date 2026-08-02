@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 
 final class PoleAppDelegate: NSObject, NSApplicationDelegate {
     private var coordinator: AppCoordinator?
@@ -12,6 +13,13 @@ final class PoleAppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+let instanceLock: SingleInstanceLock = {
+    if let lock = SingleInstanceLock.acquire() {
+        return lock
+    }
+    exit(EXIT_SUCCESS)
+}()
+
 let app = NSApplication.shared
 if Bundle.main.object(forInfoDictionaryKey: "PoleForceDarkAppearance") as? Bool == true {
     app.appearance = NSAppearance(named: .darkAqua)
@@ -19,4 +27,6 @@ if Bundle.main.object(forInfoDictionaryKey: "PoleForceDarkAppearance") as? Bool 
 let delegate = PoleAppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
-app.run()
+withExtendedLifetime(instanceLock) {
+    app.run()
+}

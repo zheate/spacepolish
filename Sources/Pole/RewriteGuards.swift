@@ -132,7 +132,8 @@ enum FactGuard {
         result: StructuredRewriteResult,
         applicationRole: ApplicationWritingRole,
         expansionRatio: Double,
-        semanticLibraries: Set<SemanticLibraryID> = SemanticLibraryID.defaultEnabled
+        semanticLibraries: Set<SemanticLibraryID> = SemanticLibraryID.defaultEnabled,
+        lengthBudget: RewriteLengthBudget? = nil
     ) -> FactAuditResult {
         let output = result.rewrittenText
         var issues: [String] = []
@@ -165,6 +166,10 @@ enum FactGuard {
         for introduction in riskyIntroductions
             where !containsAny(introduction.markers, in: sourceText)
                 && containsAny(introduction.markers, in: output) {
+            if introduction.label == "原因",
+               containsExplicitExplanatoryRelation(in: sourceText) {
+                continue
+            }
             issues.append("输出擅自增加\(introduction.label)信息")
         }
         if !containsResponsibilityAssignment(in: sourceText), containsResponsibilityAssignment(in: output) {
@@ -180,13 +185,27 @@ enum FactGuard {
             where containsAny(markers, in: sourceText) && !containsAny(markers, in: output) {
             issues.append("输出删除了关键动作：\(markers[0])")
         }
+        if changesActiveConfirmationToWaiting(
+            sourceText: sourceText,
+            outputText: output
+        ) {
+            issues.append(
+                "输出把需要主动执行的确认步骤改成了等待确认；请用“再确认……”或同等主动表述完整保留该步骤"
+            )
+        }
         for anchor in protectedClaimAnchors(in: sourceText)
             where !output.localizedCaseInsensitiveContains(anchor) {
             issues.append("输出删除了对象或受益人：\(anchor)")
         }
 
-        if applicationRole == .messaging {
-            let maximumLength = Int(ceil(Double(max(sourceText.count, 1)) * expansionRatio)) + 12
+        if let lengthBudget {
+            let maximumLength = lengthBudget.maximumCharacters(for: sourceText.count)
+            if output.count > maximumLength {
+                issues.append("输出扩写超过当前模式的长度预算")
+            }
+        } else if applicationRole == .messaging {
+            let maximumLength = Int(ceil(Double(max(sourceText.count, 1)) * expansionRatio))
+                + 12
             if output.count > maximumLength {
                 issues.append("聊天消息扩写超过预算")
             }
@@ -259,6 +278,30 @@ enum FactGuard {
         }
     }
 
+    private static func changesActiveConfirmationToWaiting(
+        sourceText: String,
+        outputText: String
+    ) -> Bool {
+        let sourceActivePattern = #"(?:再|然后|接着|随后)(?:把)?[^，。！？；\n]{0,12}确认"#
+        let outputWaitingPattern = #"等[^，。！？；\n]{0,12}确认"#
+        let outputActivePattern = #"(?:再|然后|接着|随后)(?:把)?[^，。！？；\n]{0,12}确认"#
+        return containsPattern(sourceActivePattern, in: sourceText)
+            && containsPattern(outputWaitingPattern, in: outputText)
+            && !containsPattern(outputActivePattern, in: outputText)
+    }
+
+    private static func containsPattern(_ pattern: String, in text: String) -> Bool {
+        (try? NSRegularExpression(pattern: pattern))?.firstMatch(
+            in: text,
+            range: NSRange(text.startIndex..<text.endIndex, in: text)
+        ) != nil
+    }
+
+    private static func containsExplicitExplanatoryRelation(in text: String) -> Bool {
+        containsAny(["所以", "因此", "导致"], in: text)
+            || containsPattern(#"原理上[^。！？\n]{0,24}[:：]"#, in: text)
+    }
+
     private static func protectedClaimAnchors(in text: String) -> [String] {
         let patterns = [
             #"(?:给|向|对)([\p{Han}A-Za-z0-9_·]{1,8}(?:客户|用户|同事|老板|领导|供应商|团队|部门|公司|家人|朋友))"#,
@@ -318,10 +361,25 @@ enum MessagingRewriteRetryPolicy {
         let output = normalized(candidate)
         guard source == output,
               source.count >= 6,
-              !naturallyCompleteShortMessages.contains(source) else {
+              !isNaturallyCompleteShortMessage(source) else {
             return false
         }
         return !improvementReasons(in: source).isEmpty
+    }
+
+    static func isNaturallyCompleteShortMessage(_ text: String) -> Bool {
+        let source = normalized(text)
+        if naturallyCompleteShortMessages.contains(source) { return true }
+        guard let last = source.last,
+              "。.!！?？".contains(last) else {
+            return false
+        }
+        let withoutTerminalPunctuation = String(source.dropLast())
+        guard withoutTerminalPunctuation.last.map({ !"。.!！?？".contains($0) })
+                ?? false else {
+            return false
+        }
+        return naturallyCompleteShortMessages.contains(withoutTerminalPunctuation)
     }
 
     static func improvementReasons(in sourceText: String) -> [String] {
@@ -384,6 +442,208 @@ enum MessagingRewriteRetryPolicy {
     }
 }
 
+enum AdaptivePolishIntensity: String, Equatable, Sendable {
+    case none
+    case light
+    case standard
+    case strong
+
+    var displayName: String {
+        switch self {
+        case .none:
+            return "无需修改"
+        case .light:
+            return "轻量"
+        case .standard:
+            return "标准"
+        case .strong:
+            return "强力"
+        }
+    }
+
+    var progressDescription: String {
+        switch self {
+        case .none:
+            return "无需修改"
+        case .light:
+            return "正在轻度整理…"
+        case .standard:
+            return "正在标准润色…"
+        case .strong:
+            return "正在重组表达…"
+        }
+    }
+
+    var lengthBudget: RewriteLengthBudget? {
+        switch self {
+        case .none:
+            return nil
+        case .light:
+            return .polish(maximumRatio: 1.15)
+        case .standard:
+            return .polish(maximumRatio: 1.35)
+        case .strong:
+            return .polish(maximumRatio: 1.65)
+        }
+    }
+}
+
+struct AdaptivePolishPlan: Equatable, Sendable {
+    let intensity: AdaptivePolishIntensity
+    let reasons: [String]
+
+    var shouldRequestModel: Bool {
+        intensity != .none
+    }
+
+    var progressDescription: String {
+        intensity.progressDescription
+    }
+
+    var lengthBudget: RewriteLengthBudget? {
+        intensity.lengthBudget
+    }
+
+    var modelInstruction: String {
+        let scopeInstruction: String
+        switch intensity {
+        case .none:
+            scopeInstruction = "原文已经完整、自然且可直接使用，必须逐字原样返回。"
+        case .light:
+            scopeInstruction = """
+            只处理能够明确指出的错字、标点、搭配、重复或编辑指令。尽量保留原句顺序、长度、语气和自然省略；除非修复问题确有必要，不要拆句、扩写、重构或替换本来正确的词。复核后若没有真实问题，原样返回。
+            """
+        case .standard:
+            scopeInstruction = """
+            处理所有真实表达问题，允许做必要的局部改写、语序调整或拆句，但不要整体换一种说法，也不要扩大原文信息。修改幅度应与问题数量相匹配；复核后若没有真实问题，可以原样返回。
+            """
+        case .strong:
+            scopeInstruction = """
+            原文存在较明显的结构或层级问题，可以重排句子、段落和并列项，使逻辑更清楚；仍须完整保留事实、术语、数字、动作顺序、语气和确定程度，不得扩写成原文没有的信息或改成模板化文体。
+            """
+        }
+
+        let reasonText = reasons.prefix(3).joined(separator: "；")
+        let reasonLine = reasonText.isEmpty
+            ? ""
+            : "\n本地预检依据：\(reasonText)。"
+        return """
+        当前润色强度：\(intensity.displayName)。
+        \(scopeInstruction)\(reasonLine)
+        若本段规则与前面的主动改写要求冲突，以本段规定的修改幅度为准。
+        """
+    }
+}
+
+enum AdaptivePolishPolicy {
+    static func plan(
+        for sourceText: String,
+        applicationRole: ApplicationWritingRole
+    ) -> AdaptivePolishPlan {
+        let source = sourceText.precomposedStringWithCanonicalMapping
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !source.isEmpty else {
+            return AdaptivePolishPlan(
+                intensity: .none,
+                reasons: ["没有可处理的正文"]
+            )
+        }
+
+        let paragraphCount = source
+            .components(separatedBy: .newlines)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .count
+        let separatorCount = source.filter {
+            "，,；;：:。！？!?".contains($0)
+        }.count
+        let issueReasons = MessagingRewriteRetryPolicy.improvementReasons(in: source)
+
+        if shouldUseStrongPolish(
+            source: source,
+            paragraphCount: paragraphCount,
+            separatorCount: separatorCount,
+            applicationRole: applicationRole
+        ) {
+            var reasons = issueReasons
+            reasons.append("文本较长或包含多个层级，需要结构整理")
+            return AdaptivePolishPlan(
+                intensity: .strong,
+                reasons: unique(reasons)
+            )
+        }
+
+        if MessagingRewriteRetryPolicy.isNaturallyCompleteShortMessage(source)
+            || (source.count <= 12
+                && issueReasons.isEmpty
+                && isStructurallySimpleShortText(source)) {
+            return AdaptivePolishPlan(
+                intensity: .none,
+                reasons: ["短文本表达完整，未发现明确问题"]
+            )
+        }
+
+        if !issueReasons.isEmpty {
+            let intensity: AdaptivePolishIntensity = source.count <= 24
+                && paragraphCount <= 1
+                && separatorCount <= 2
+                ? .light
+                : .standard
+            return AdaptivePolishPlan(
+                intensity: intensity,
+                reasons: unique(issueReasons)
+            )
+        }
+
+        if source.count <= 24,
+           paragraphCount <= 1,
+           separatorCount <= 1 {
+            return AdaptivePolishPlan(
+                intensity: .light,
+                reasons: ["短文本只需要局部检查"]
+            )
+        }
+
+        return AdaptivePolishPlan(
+            intensity: .standard,
+            reasons: ["存在多个表达单元，需要完整检查"]
+        )
+    }
+
+    private static func shouldUseStrongPolish(
+        source: String,
+        paragraphCount: Int,
+        separatorCount: Int,
+        applicationRole: ApplicationWritingRole
+    ) -> Bool {
+        if ParallelListPolicy.shouldPreferNumberedList(source) { return true }
+        if paragraphCount >= 3 || source.count >= 96 { return true }
+        if source.count >= 64, separatorCount >= 5 { return true }
+        switch applicationRole {
+        case .messaging, .document, .email, .generic:
+            if source.count >= 48, separatorCount <= 1 { return true }
+            if applicationRole == .document || applicationRole == .email {
+                return source.count >= 64 && paragraphCount >= 2
+            }
+            return false
+        default:
+            return false
+        }
+    }
+
+    private static func unique(_ reasons: [String]) -> [String] {
+        var seen: Set<String> = []
+        return reasons.filter { seen.insert($0).inserted }
+    }
+
+    private static func isStructurallySimpleShortText(_ source: String) -> Bool {
+        var body = source
+        if let last = body.last, "。.!！?？".contains(last) {
+            body.removeLast()
+        }
+        return !body.contains(where: { "，,；;：:。！？!?".contains($0) })
+    }
+}
+
 enum RewriteQualityGuard {
     private static let reportStylePhrases = [
         "现将", "现同步", "经沟通确认", "相关事宜", "综上所述", "具体如下",
@@ -393,14 +653,17 @@ enum RewriteQualityGuard {
     static func audit(
         sourceText: String,
         outputText: String,
-        applicationRole: ApplicationWritingRole
+        applicationRole: ApplicationWritingRole,
+        rewriteMode: RewriteMode = .polish,
+        lengthBudget: RewriteLengthBudget? = nil
     ) -> RewriteQualityAuditResult {
         let source = normalized(sourceText)
         let output = normalized(outputText)
         let changed = source != output
         var issues: [String] = []
 
-        if applicationRole == .messaging,
+        if rewriteMode == .polish,
+           applicationRole == .messaging,
            !changed,
            MessagingRewriteRetryPolicy.shouldRetryUnchanged(
                sourceText: sourceText,
@@ -416,6 +679,20 @@ enum RewriteQualityGuard {
             )
         }
 
+        if rewriteMode == .expand,
+           ExpansionPolicy.shouldRequireExpansion(source),
+           output.count < (lengthBudget ?? .expansion)
+               .preferredMinimumCharacters(for: source.count) {
+            issues.append(
+                "候选没有完成适当扩写，只做了等长改写或压缩；请至少补全一处原文已有的省略成分或紧缩关系，不能只增加语气词、礼貌词或替换近义词"
+            )
+        }
+
+        if let lengthBudget,
+           output.count > lengthBudget.maximumCharacters(for: source.count) {
+            issues.append("候选扩写超过当前模式允许的长度")
+        }
+
         if applicationRole == .messaging {
             if MessagingRewriteRetryPolicy.containsTrailingEditorInstruction(in: source),
                MessagingRewriteRetryPolicy.containsTrailingEditorInstruction(in: output) {
@@ -427,13 +704,20 @@ enum RewriteQualityGuard {
             }
             if source.count <= 48,
                !source.contains("\n"),
-               output.contains("\n") {
+               output.contains("\n"),
+               !ParallelListPolicy.shouldPreferNumberedList(source) {
                 issues.append("简短聊天被扩写成了分段文本")
             }
-            if source.count >= 8,
+            if lengthBudget == nil,
+               source.count >= 8,
                output.count > max(source.count + 20, Int(Double(source.count) * 1.65)) {
                 issues.append("聊天结果扩写过多，不像原有表达节奏")
             }
+        }
+
+        if ParallelListPolicy.shouldPreferNumberedList(source),
+           !ParallelListPolicy.containsNumberedList(output) {
+            issues.append("原文包含至少三个明确的并列项；请使用“1、2、3……”逐条换行列出")
         }
 
         return RewriteQualityAuditResult(
@@ -453,7 +737,9 @@ enum RewriteAlignmentGuard {
     static func audit(
         sourceText: String,
         outputText: String,
-        applicationRole: ApplicationWritingRole
+        applicationRole: ApplicationWritingRole,
+        rewriteMode: RewriteMode = .polish,
+        lengthBudget: RewriteLengthBudget? = nil
     ) -> RewriteAlignmentAuditResult {
         let source = contentCharacters(in: sourceText)
         let output = contentCharacters(in: outputText)
@@ -486,8 +772,13 @@ enum RewriteAlignmentGuard {
            !allowsConciseCleanup {
             issues.append("输出大幅压缩了原文，可能删除了必要信息")
         }
-        if outputLengthRatio > 1.85,
-           introducedOutputRatio > 0.42 {
+        let excessiveExpansionRatio = rewriteMode == .expand ? 2.15 : 1.85
+        let excessiveIntroductionRatio = rewriteMode == .expand ? 0.58 : 0.42
+        let exceedsExplicitBudget = lengthBudget.map {
+            outputText.count > $0.maximumCharacters(for: sourceText.count)
+        } ?? false
+        if (outputLengthRatio > excessiveExpansionRatio || exceedsExplicitBudget),
+           introducedOutputRatio > excessiveIntroductionRatio {
             issues.append("输出大幅扩写了原文，可能增加了无依据内容")
         }
 

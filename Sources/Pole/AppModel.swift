@@ -1,6 +1,13 @@
 import Combine
 import Foundation
 
+enum APIConnectionState: Equatable {
+    case unknown
+    case checking
+    case valid
+    case invalid(String)
+}
+
 final class AppModel: ObservableObject {
     static let defaultPrompt = PromptPolicy.currentDefault
 
@@ -17,6 +24,7 @@ final class AppModel: ObservableObject {
     @Published var rewriteLearningEnabled: Bool
     @Published var helperPath: String
     @Published var helperStatusText = "未配置"
+    @Published private(set) var apiConnectionState: APIConnectionState = .unknown
     let conversationProfiles: ConversationProfileStore
     let intelligence: CommunicationIntelligenceStore
 
@@ -35,21 +43,51 @@ final class AppModel: ObservableObject {
         self.isEnabled = defaults.object(forKey: "isEnabled") as? Bool ?? true
         self.apiKey = (try? keychain.read()) ?? ""
         let savedModel = defaults.string(forKey: "modelName")
-        self.modelName = savedModel == "qwen3.6-flash" ? savedModel! : "qwen3.7-plus"
+        self.modelName = ["qwen3.7-plus", "qwen3.6-flash"].contains(savedModel)
+            ? savedModel!
+            : QwenClient.defaultModel
         self.prompt = PromptPolicy.resolvedPrompt(from: defaults.string(forKey: "prompt"))
 
         let savedInterval = defaults.double(forKey: "triggerInterval")
         self.triggerInterval = savedInterval > 0 ? savedInterval : 1.2
         self.soundEffectsEnabled = defaults.object(forKey: "soundEffectsEnabled") as? Bool ?? true
         self.enabledSemanticLibraries = SemanticLibraryPreferences.load(from: defaults)
-        self.historyAnalysisEnabled = defaults.bool(forKey: "historyAnalysisEnabled")
+        let helperURL = Self.resolveHelperURL(from: defaults)
+        self.historyAnalysisEnabled = helperURL != nil
+            && defaults.bool(forKey: "historyAnalysisEnabled")
         self.rewriteLearningEnabled = defaults.bool(forKey: "rewriteLearningEnabled")
-        self.helperPath = Self.resolveHelperURL(from: defaults)?.path ?? ""
+        self.helperPath = helperURL?.path ?? ""
         self.helperStatusText = helperPath.isEmpty ? "未配置" : "待检测"
     }
 
     var hasAPIKey: Bool {
         !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var canUseAPI: Bool {
+        guard hasAPIKey else { return false }
+        switch apiConnectionState {
+        case .checking, .invalid:
+            return false
+        case .unknown, .valid:
+            return true
+        }
+    }
+
+    func markAPIKeyChecking() {
+        apiConnectionState = .checking
+    }
+
+    func markAPIKeyValid() {
+        apiConnectionState = .valid
+    }
+
+    func markAPIKeyInvalid(_ message: String) {
+        apiConnectionState = .invalid(message)
+    }
+
+    func markAPIKeyUnknown() {
+        apiConnectionState = .unknown
     }
 
     func save() throws {
@@ -67,6 +105,9 @@ final class AppModel: ObservableObject {
         defaults.set(triggerInterval, forKey: "triggerInterval")
         defaults.set(soundEffectsEnabled, forKey: "soundEffectsEnabled")
         SemanticLibraryPreferences.save(enabledSemanticLibraries, to: defaults)
+        if helperURL == nil {
+            historyAnalysisEnabled = false
+        }
         defaults.set(historyAnalysisEnabled, forKey: "historyAnalysisEnabled")
         defaults.set(rewriteLearningEnabled, forKey: "rewriteLearningEnabled")
         defaults.removeObject(forKey: "conversationHelperPath")
@@ -80,6 +121,8 @@ final class AppModel: ObservableObject {
         guard let url else {
             helperPath = ""
             helperStatusText = "未配置"
+            historyAnalysisEnabled = false
+            defaults.set(false, forKey: "historyAnalysisEnabled")
             defaults.removeObject(forKey: "conversationHelperBookmark")
             defaults.removeObject(forKey: "conversationHelperPath")
             return

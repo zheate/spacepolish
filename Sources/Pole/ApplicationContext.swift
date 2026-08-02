@@ -78,6 +78,30 @@ struct ApplicationContext: Equatable {
     }
 }
 
+enum RewriteTargetSafetyPolicy {
+    private static let terminalBundleIdentifiers: Set<String> = [
+        "com.apple.terminal",
+        "com.googlecode.iterm2",
+        "dev.warp.warp-stable",
+        "dev.warp.warp",
+        "com.github.wez.wezterm",
+        "org.alacritty",
+        "io.alacritty",
+        "com.mitchellh.ghostty",
+        "net.kovidgoyal.kitty",
+        "co.zeit.hyper"
+    ]
+
+    static func allowsRewrite(bundleIdentifier: String) -> Bool {
+        !terminalBundleIdentifiers.contains(bundleIdentifier.lowercased())
+    }
+
+    static func blockedReason(bundleIdentifier: String) -> String? {
+        guard !allowsRewrite(bundleIdentifier: bundleIdentifier) else { return nil }
+        return "为避免误执行命令，Pole 不在终端中触发"
+    }
+}
+
 enum ApplicationContextClassifier {
     private static let knownDisplayNames: [String: String] = [
         "com.openai.codex": "Codex",

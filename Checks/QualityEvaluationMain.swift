@@ -9,8 +9,11 @@ private struct CandidateAudit {
 struct QualityEvaluationMain {
     static func main() async {
         do {
-            let arguments = CommandLine.arguments.dropFirst()
-            let selector = arguments.first
+            let arguments = Array(CommandLine.arguments.dropFirst())
+            let rewriteMode: RewriteMode = arguments.contains("--expand")
+                ? .expand
+                : .polish
+            let selector = arguments.first { !$0.hasPrefix("--") }
             let keychainAPIKey = try KeychainStore().read()
             let apiKey = ProcessInfo.processInfo.environment["POLE_API_KEY"]
                 ?? keychainAPIKey
@@ -21,14 +24,17 @@ struct QualityEvaluationMain {
             }
 
             let client = QwenClient()
-            let model = "qwen3.7-plus"
+            let model = QwenClient.defaultModel
+            let corpus = rewriteMode == .expand
+                ? ExpansionQualityCorpus.core
+                : RewriteQualityCorpus.core
             let samples: [RewriteQualitySample]
             if let selector, let limit = Int(selector) {
-                samples = Array(RewriteQualityCorpus.core.prefix(max(0, limit)))
+                samples = Array(corpus.prefix(max(0, limit)))
             } else if let selector {
-                samples = RewriteQualityCorpus.core.filter { $0.id == selector }
+                samples = corpus.filter { $0.id == selector }
             } else {
-                samples = RewriteQualityCorpus.core
+                samples = corpus
             }
             var passed = 0
             var unchangedFailures = 0
@@ -40,7 +46,11 @@ struct QualityEvaluationMain {
                 let role: ApplicationWritingRole = sample.category == .development
                     ? .development
                     : .messaging
-                let prompt = prompt(for: sample.sourceText, role: role)
+                let prompt = prompt(
+                    for: sample.sourceText,
+                    role: role,
+                    rewriteMode: rewriteMode
+                )
                 let startedAt = DispatchTime.now().uptimeNanoseconds
                 var candidate = try await client.optimize(
                     text: sample.sourceText,
@@ -51,7 +61,8 @@ struct QualityEvaluationMain {
                 var candidateAudit = audit(
                     sourceText: sample.sourceText,
                     outputText: candidate,
-                    role: role
+                    role: role,
+                    rewriteMode: rewriteMode
                 )
 
                 if !candidateAudit.accepted {
@@ -66,12 +77,21 @@ struct QualityEvaluationMain {
                     candidateAudit = audit(
                         sourceText: sample.sourceText,
                         outputText: candidate,
-                        role: role
+                        role: role,
+                        rewriteMode: rewriteMode
                     )
                 }
 
                 let changed = normalized(sample.sourceText) != normalized(candidate)
-                let meetsChangeExpectation = sample.requiresImprovement ? changed : true
+                let meetsChangeExpectation: Bool
+                if rewriteMode == .expand, sample.requiresImprovement {
+                    meetsChangeExpectation = candidate.count
+                        >= RewriteLengthBudget.expansion.preferredMinimumCharacters(
+                            for: sample.sourceText.count
+                        )
+                } else {
+                    meetsChangeExpectation = sample.requiresImprovement ? changed : true
+                }
                 let accepted = candidateAudit.accepted && meetsChangeExpectation
                 if accepted {
                     passed += 1
@@ -96,7 +116,8 @@ struct QualityEvaluationMain {
 
             let average = samples.isEmpty ? 0 : totalMilliseconds / samples.count
             print(
-                "SUMMARY total=\(samples.count) passed=\(passed) "
+                "SUMMARY mode=\(rewriteMode == .expand ? "expand" : "polish") "
+                    + "total=\(samples.count) passed=\(passed) "
                     + "unchanged_failures=\(unchangedFailures) guard_failures=\(guardFailures) "
                     + "retried=\(retried) average_ms=\(average)"
             )
@@ -109,7 +130,8 @@ struct QualityEvaluationMain {
 
     private static func prompt(
         for sourceText: String,
-        role: ApplicationWritingRole
+        role: ApplicationWritingRole,
+        rewriteMode: RewriteMode
     ) -> String {
         let applicationContext = ApplicationContext(
             bundleIdentifier: role == .messaging
@@ -144,23 +166,44 @@ struct QualityEvaluationMain {
         let contextInstruction = [applicationInstruction, semanticInstruction]
             .compactMap { $0 }
             .joined(separator: "\n")
+        if rewriteMode == .expand {
+            return PromptPolicy.expansionPrompt(
+                contextInstruction: contextInstruction
+            )
+        }
         return PromptPolicy.polishPrompt(
             basePrompt: PromptPolicy.currentDefault,
-            contextInstruction: contextInstruction
+            contextInstruction: contextInstruction,
+            adaptivePlan: AdaptivePolishPolicy.plan(
+                for: sourceText,
+                applicationRole: role
+            )
         )
     }
 
     private static func audit(
         sourceText: String,
         outputText: String,
-        role: ApplicationWritingRole
+        role: ApplicationWritingRole,
+        rewriteMode: RewriteMode
     ) -> CandidateAudit {
+        let lengthBudget: RewriteLengthBudget?
+        switch rewriteMode {
+        case .expand:
+            lengthBudget = .expansion
+        case .polish:
+            lengthBudget = AdaptivePolishPolicy.plan(
+                for: sourceText,
+                applicationRole: role
+            ).lengthBudget
+        }
         let result = StructuredRewriteResult(rewrittenText: outputText)
         let fact = FactGuard.audit(
             sourceText: sourceText,
             result: result,
             applicationRole: role,
-            expansionRatio: 1.35
+            expansionRatio: 1.35,
+            lengthBudget: lengthBudget
         )
         let voice = VoiceGuard.audit(
             sourceText: sourceText,
@@ -171,12 +214,16 @@ struct QualityEvaluationMain {
         let alignment = RewriteAlignmentGuard.audit(
             sourceText: sourceText,
             outputText: outputText,
-            applicationRole: role
+            applicationRole: role,
+            rewriteMode: rewriteMode,
+            lengthBudget: lengthBudget
         )
         let quality = RewriteQualityGuard.audit(
             sourceText: sourceText,
             outputText: outputText,
-            applicationRole: role
+            applicationRole: role,
+            rewriteMode: rewriteMode,
+            lengthBudget: lengthBudget
         )
         let issues = fact.issues + voice.issues + alignment.issues + quality.issues
         return CandidateAudit(

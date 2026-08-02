@@ -26,4 +26,8 @@ swiftc \
     Checks/QualityEvaluationMain.swift \
     -o "$EVALUATION_BINARY"
 
-"$EVALUATION_BINARY" "${1:-40}"
+if (( $# == 0 )); then
+    "$EVALUATION_BINARY" 40
+else
+    "$EVALUATION_BINARY" "$@"
+fi

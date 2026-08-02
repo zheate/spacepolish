@@ -79,3 +79,32 @@ enum RewriteQualityCorpus {
         .init("dev-04", .development, "currentText == capturedText这个判断不能删，这个是为了防止等待的时候覆盖用户新的内容。", protectedTokens: ["currentText", "capturedText"])
     ]
 }
+
+enum ExpansionQualityCorpus {
+    // Every sample contains enough explicit source information to organize more
+    // fully without inventing facts. Short acknowledgements verify safe no-op.
+    static let core: [RewriteQualitySample] = [
+        .init("expand-mfg-01", .manufacturing, "BOM 还没确认，等规格定了再算成本。", protectedTokens: ["BOM"]),
+        .init("expand-mfg-02", .manufacturing, "CAPA 还缺原因分析和改善措施，补齐后再发我。", protectedTokens: ["CAPA"]),
+        .init("expand-mfg-03", .manufacturing, "260件订单先确认备料，有缺料的提前说。", protectedTokens: ["260"]),
+        .init("expand-mfg-04", .manufacturing, "局部镀规格没定，报价和成本都先不要锁。"),
+        .init("expand-mfg-05", .manufacturing, "材料准备了一部分，剩余交期还不能确定。"),
+        .init("expand-opt-01", .optics, "780 nm 激光准直后光斑还是偏大，原因还需要分析。", protectedTokens: ["780 nm"]),
+        .init("expand-opt-02", .optics, "这个指标原理上做不到：聚焦前后不能同时保持方形光斑。"),
+        .init("expand-opt-03", .optics, "M² 测了三次，结果差别比较大，重复性不好。", protectedTokens: ["M²"]),
+        .init("expand-embedded-01", .embedded, "新的 I2C 驱动不稳定，上电会通信中断，之后持续报错。", protectedTokens: ["I2C"]),
+        .init("expand-embedded-02", .embedded, "ESP32 能连上，但数据传一会儿就会断。", protectedTokens: ["ESP32"]),
+        .init("expand-customer-01", .customer, "这个指标还不能确认，需要验证后才能给结论。"),
+        .init("expand-customer-02", .customer, "报价按新数量算好了，更新版在附件里，您看一下。"),
+        .init("expand-customer-03", .customer, "交期可能受材料影响，现在还没最终确定。"),
+        .init("expand-colleague-01", .colleague, "先把报价发给客户，再确认合同，确认后回复我。"),
+        .init("expand-colleague-02", .colleague, "测试做完把结果发我，异常的地方单独标出来。"),
+        .init("expand-colleague-03", .colleague, "下午开会要用材料，有问题提前和我说。"),
+        .init("expand-dev-01", .development, "接口报错了，帮我检查 POST /api/v1/calculate，不要修改路径。", protectedTokens: ["POST /api/v1/calculate"]),
+        .init("expand-dev-02", .development, "currentText == capturedText 不能删，避免等待时覆盖新内容。", protectedTokens: ["currentText", "capturedText"]),
+        .init("expand-list-01", .manufacturing, "这次需要确认四项：规格、数量、交期、局部镀范围。"),
+        .init("expand-list-02", .development, "上线前需要检查三点：接口路径不能改；参数要保留；等待期间不能覆盖新内容。"),
+        .init("expand-short-01", .casual, "好的", requiresImprovement: false),
+        .init("expand-short-02", .casual, "收到", requiresImprovement: false)
+    ]
+}

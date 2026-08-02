@@ -53,6 +53,70 @@ private func waitForAsync<T>(
 }
 
 do {
+    let lockURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("pole-single-instance-\(UUID().uuidString).lock")
+    guard let firstLock = SingleInstanceLock.acquire(fileURL: lockURL) else {
+        throw NSError(domain: "PoleChecks", code: 1)
+    }
+    check(
+        SingleInstanceLock.acquire(fileURL: lockURL) == nil,
+        "单实例锁拒绝第二个 Pole 进程"
+    )
+    firstLock.release()
+    let replacementLock = SingleInstanceLock.acquire(fileURL: lockURL)
+    check(replacementLock != nil, "Pole 退出后单实例锁可重新获取")
+    replacementLock?.release()
+    try? FileManager.default.removeItem(at: lockURL)
+} catch {
+    failures += 1
+    print("FAIL  单实例锁检查抛出异常：\(error)")
+}
+
+do {
+    let models = Data(
+        #"{"data":[{"id":"qwen3.7-plus"},{"id":"qwen3.6-flash"}]}"#.utf8
+    )
+    try QwenCredentialValidationPolicy.validate(
+        statusCode: 200,
+        data: models,
+        requiredModel: QwenClient.defaultModel
+    )
+    check(true, "Qwen 凭证校验接受可用模型")
+} catch {
+    check(false, "Qwen 凭证校验接受可用模型")
+}
+
+do {
+    try QwenCredentialValidationPolicy.validate(
+        statusCode: 401,
+        data: Data(#"{"error":{"message":"invalid key"}}"#.utf8),
+        requiredModel: QwenClient.defaultModel
+    )
+    check(false, "Qwen 凭证校验识别失效 API Key")
+} catch let error as QwenError {
+    check(error.isAuthenticationFailure, "Qwen 凭证校验识别失效 API Key")
+} catch {
+    check(false, "Qwen 凭证校验识别失效 API Key")
+}
+
+do {
+    try QwenCredentialValidationPolicy.validate(
+        statusCode: 200,
+        data: Data(#"{"data":[{"id":"qwen3.6-flash"}]}"#.utf8),
+        requiredModel: QwenClient.defaultModel
+    )
+    check(false, "Qwen 凭证校验拒绝不可用模型")
+} catch let error as QwenError {
+    if case .modelUnavailable(let model) = error {
+        check(model == QwenClient.defaultModel, "Qwen 凭证校验拒绝不可用模型")
+    } else {
+        check(false, "Qwen 凭证校验拒绝不可用模型")
+    }
+} catch {
+    check(false, "Qwen 凭证校验拒绝不可用模型")
+}
+
+do {
     let input = "这个表达有一点不太好"
     let plan = try TextRangePlanner.plan(
         text: input,
@@ -469,8 +533,20 @@ check(
     "通用回退保留微信支持"
 )
 check(
-    KeyboardFallbackPolicy.allows(bundleIdentifier: "com.apple.Terminal"),
-    "通用回退允许终端"
+    !KeyboardFallbackPolicy.allows(bundleIdentifier: "com.apple.Terminal"),
+    "键盘回退拒绝终端"
+)
+check(
+    RewriteTargetSafetyPolicy.blockedReason(
+        bundleIdentifier: "com.googlecode.iterm2"
+    ) != nil,
+    "触发前安全策略拒绝 iTerm"
+)
+check(
+    RewriteTargetSafetyPolicy.allowsRewrite(
+        bundleIdentifier: "com.microsoft.VSCode"
+    ),
+    "终端安全策略不误伤普通开发编辑器"
 )
 check(
     !KeyboardFallbackPolicy.allows(bundleIdentifier: "com.spacepolish.mac"),
@@ -566,6 +642,116 @@ check(
         && chineseEditingPrompt.contains("只作为编辑指令，不写入成稿")
         && chineseEditingPrompt.contains("聊天规则"),
     "润色请求包含中文语法、词语搭配和原文对齐规则"
+)
+let noChangePolishPlan = AdaptivePolishPolicy.plan(
+    for: "收到",
+    applicationRole: .messaging
+)
+let naturalCommandPolishPlan = AdaptivePolishPolicy.plan(
+    for: "字体大一点儿。",
+    applicationRole: .messaging
+)
+let punctuatedReplyPolishPlan = AdaptivePolishPolicy.plan(
+    for: "收到。",
+    applicationRole: .messaging
+)
+check(
+    noChangePolishPlan.intensity == .none
+        && !noChangePolishPlan.shouldRequestModel
+        && naturalCommandPolishPlan.intensity == .none
+        && punctuatedReplyPolishPlan.intensity == .none,
+    "自然短回复和完整短指令直接判定为无需修改"
+)
+let lightPolishPlan = AdaptivePolishPolicy.plan(
+    for: "这个结果不对，，麻烦再检查一下",
+    applicationRole: .messaging
+)
+check(
+    lightPolishPlan.intensity == .light
+        && lightPolishPlan.shouldRequestModel,
+    "明确但局部的标点问题使用轻量润色"
+)
+let standardPolishPlan = AdaptivePolishPolicy.plan(
+    for: "这个方案目前的问题是定位不够清楚，而且信息层级也比较乱，需要重新梳理一下。",
+    applicationRole: .messaging
+)
+check(
+    standardPolishPlan.intensity == .standard,
+    "包含多个表达单元的普通文本使用标准润色"
+)
+let strongPolishPlan = AdaptivePolishPolicy.plan(
+    for: "需要确认四项：规格、数量、交期、局部镀范围。",
+    applicationRole: .document
+)
+let runOnPolishPlan = AdaptivePolishPolicy.plan(
+    for: "今天和供应商讨论了材料和交期以及成本几个问题有些地方还没有确定需要他们回去确认之后再统一回复我们。",
+    applicationRole: .messaging
+)
+check(
+    strongPolishPlan.intensity == .strong
+        && runOnPolishPlan.intensity == .strong,
+    "明确的多项结构使用强力润色"
+)
+let adaptiveLightPrompt = PromptPolicy.polishPrompt(
+    basePrompt: "基础规则",
+    contextInstruction: "聊天规则",
+    adaptivePlan: lightPolishPlan
+)
+check(
+    adaptiveLightPrompt.contains("当前润色强度：轻量")
+        && adaptiveLightPrompt.contains("不要拆句、扩写、重构")
+        && adaptiveLightPrompt.contains("以本段规定的修改幅度为准"),
+    "自适应强度作为末端规则约束模型修改幅度"
+)
+check(
+    (lightPolishPlan.lengthBudget?.maximumCharacters(for: 40) ?? 0)
+        < (strongPolishPlan.lengthBudget?.maximumCharacters(for: 40) ?? 0),
+    "不同润色强度使用递增的长度预算"
+)
+let expansionPrompt = PromptPolicy.expansionPrompt(
+    contextInstruction: "当前是同事聊天"
+)
+check(
+    expansionPrompt.contains("需要“适当扩写”的原文")
+        && expansionPrompt.contains("只能展开原文已有信息")
+        && expansionPrompt.contains("不得为了变长加入空话")
+        && expansionPrompt.contains("当前是同事聊天"),
+    "适当扩写使用独立提示词并保留场景规则"
+)
+check(
+    !PromptPolicy.polishPrompt(basePrompt: "基础规则", contextInstruction: nil)
+        .contains("需要“适当扩写”的原文"),
+    "适当扩写提示词不会污染普通润色"
+)
+check(
+    RewriteLengthBudget.expansion.preferredMinimumCharacters(for: 40) == 46,
+    "扩写长度预算提供可感知的最小改善目标"
+)
+check(
+    RewriteLengthBudget.expansion.maximumCharacters(for: 40) == 80
+        && RewriteLengthBudget.expansion.maximumCharacters(for: 5) == 32
+        && RewriteLengthBudget.expansion.maximumCharacters(for: 500) == 660,
+    "扩写长度预算同时限制比例、短文本空间和绝对增量"
+)
+check(
+    ExpansionPolicy.shouldRequireExpansion("BOM 还没确认，等规格定了再算成本。")
+        && !ExpansionPolicy.shouldRequireExpansion("好的")
+        && !ExpansionPolicy.shouldRequireExpansion("这是一句已经完整清楚而且没有可展开关系的表达。"),
+    "扩写策略只要求有足够信息的文本产生扩写"
+)
+let numberedParallelText = "需要确认以下四项：\n1、规格\n2、数量\n3、交期\n4、局部镀范围"
+check(
+    ParallelListPolicy.shouldPreferNumberedList(
+        "这次需要确认四项：规格、数量、交期、局部镀范围。"
+    )
+        && ParallelListPolicy.containsNumberedList(numberedParallelText),
+    "明确的三项以上并列内容会识别为编号列表"
+)
+check(
+    !ParallelListPolicy.shouldPreferNumberedList(
+        "BOM 还没确认，等规格定了再算成本。"
+    ),
+    "普通连续分句不会被误识别为编号列表"
 )
 check(
     PromptPolicy.currentDefault.contains("结论和确定程度")
@@ -782,6 +968,25 @@ check(
 )
 check(
     OptimizationOutcome.classify(
+        sourceText: "同样的内容\r\n第二行",
+        result: "同样的\u{200B}内容\n第二行"
+    ) == .unchanged,
+    "只有换行编码或零宽占位差异时归类为无需修改"
+)
+check(
+    OptimizationOutcome.classify(
+        sourceText: "规格 A",
+        result: "规格\u{00A0}A"
+    ) == .unchanged,
+    "普通空格与不换行空格的视觉等价结果归类为无需修改"
+)
+check(
+    OptimizationOutcome.classify(sourceText: "规格 A", result: "规格A")
+        != .unchanged,
+    "真实可见的空格删除仍归类为修改"
+)
+check(
+    OptimizationOutcome.classify(
         sourceText: "这句话有一点不通顺",
         result: "这句话有一点不够通顺"
     ) == .partial,
@@ -812,12 +1017,26 @@ check(
     InputProgressSoundCue.result(
         for: .unchanged,
         operation: .translation
-    ) == .completion,
-    "翻译完成始终使用确认音"
+    ) == .unchanged,
+    "翻译结果未变化时也使用无需修改提示音"
 )
 check(
-    InputProgressSoundCue.completion.soundName == "Glass",
-    "完成态使用灯泡点亮感的清亮音效"
+    InputProgressSoundCue.completion.resourceName == "uisfx-minimal-complete",
+    "完成态使用 UI SFX Minimal 的流程完成音效"
+)
+check(
+    InputProgressSoundCue.completion.fallbackSoundName == "Glass",
+    "完成音效资源缺失时回退到系统 Glass"
+)
+let completionColor = InputProgressPalette.completion
+check(
+    completionColor.redComponent < 0.10
+        && completionColor.greenComponent > 0.50
+        && completionColor.greenComponent < 0.56
+        && completionColor.blueComponent > 0.25
+        && completionColor.blueComponent < 0.30
+        && completionColor.alphaComponent == 1,
+    "完成勾选使用白底清晰的深绿色"
 )
 check(
     QwenClient.requestTimeout(for: "短消息", isRetry: false) == 20,
@@ -868,7 +1087,8 @@ check(
     "减少动态效果时直接定位"
 )
 check(QwenClient.temperature == 0.5, "模型温度保持为 0.5")
-check(!QwenClient.enableThinking, "Qwen 3.7 Plus 关闭思考模式")
+check(QwenClient.defaultModel == "qwen3.7-plus", "默认使用 Qwen 3.7 Plus")
+check(!QwenClient.enableThinking, "Qwen 关闭思考模式")
 
 let codexApplicationContext = ApplicationContextClassifier.context(
     bundleIdentifier: "com.openai.codex",
@@ -1508,7 +1728,152 @@ check(
     ).accepted,
     "质量门允许已经自然的短消息保持不变"
 )
+check(
+    !RewriteQualityGuard.audit(
+        sourceText: "BOM 还没确认，等规格定了再算成本。",
+        outputText: "BOM 还没确认，等规格定了再算成本。",
+        applicationRole: .messaging,
+        rewriteMode: .expand,
+        lengthBudget: .expansion
+    ).accepted,
+    "扩写质量门拒绝对可扩写文本原样返回"
+)
+check(
+    RewriteQualityGuard.audit(
+        sourceText: "BOM 还没确认，等规格定了再算成本。",
+        outputText: "BOM 目前还没有确认，成本需要等最终规格确定后再重新核算。",
+        applicationRole: .messaging,
+        rewriteMode: .expand,
+        lengthBudget: .expansion
+    ).accepted,
+    "扩写质量门接受长度适中且忠实的成稿"
+)
+check(
+    !RewriteQualityGuard.audit(
+        sourceText: "这个指标还不能确认，需要验证后才能给结论。",
+        outputText: String(repeating: "这个指标仍需验证后再确认。", count: 8),
+        applicationRole: .messaging,
+        rewriteMode: .expand,
+        lengthBudget: .expansion
+    ).accepted,
+    "扩写质量门拒绝通过重复内容突破长度预算"
+)
+check(
+    !RewriteQualityGuard.audit(
+        sourceText: "这次需要确认四项：规格、数量、交期、局部镀范围。",
+        outputText: "这次需要确认规格、数量、交期和局部镀范围。",
+        applicationRole: .messaging,
+        rewriteMode: .expand,
+        lengthBudget: .expansion
+    ).accepted,
+    "明显并列层级未编号换行时会触发重试"
+)
+check(
+    RewriteQualityGuard.audit(
+        sourceText: "这次需要确认四项：规格、数量、交期、局部镀范围。",
+        outputText: "这次需要确认以下四项：\n1、规格\n2、数量\n3、交期\n4、局部镀范围",
+        applicationRole: .messaging,
+        rewriteMode: .expand,
+        lengthBudget: .expansion
+    ).accepted,
+    "明显并列层级允许使用编号和适当换行"
+)
+check(
+    !FactGuard.audit(
+        sourceText: "这个指标还不能确认，需要验证后才能给结论。",
+        result: StructuredRewriteResult(
+            rewrittenText: String(repeating: "这个指标仍需验证后再确认。", count: 8)
+        ),
+        applicationRole: .messaging,
+        expansionRatio: 1.35,
+        lengthBudget: .expansion
+    ).accepted,
+    "事实守卫执行扩写模式的独立最大长度预算"
+)
+check(
+    !FactGuard.audit(
+        sourceText: "先把报价发给客户，再确认合同，确认后回复我。",
+        result: StructuredRewriteResult(
+            rewrittenText: "先把报价发给客户，等合同确认好之后，再回复我。"
+        ),
+        applicationRole: .messaging,
+        expansionRatio: 1.35,
+        lengthBudget: .expansion
+    ).accepted,
+    "事实守卫拒绝把主动确认步骤改成被动等待"
+)
+check(
+    FactGuard.audit(
+        sourceText: "先把报价发给客户，再确认合同，确认后回复我。",
+        result: StructuredRewriteResult(
+            rewrittenText: "先把报价发给客户，然后再确认合同。合同确认好以后，记得回复我一声。"
+        ),
+        applicationRole: .messaging,
+        expansionRatio: 1.35,
+        lengthBudget: .expansion
+    ).accepted,
+    "事实守卫接受保留主动步骤的适当扩写"
+)
+check(
+    FactGuard.audit(
+        sourceText: "先把报价发给客户，再确认合同，确认后回复我。",
+        result: StructuredRewriteResult(
+            rewrittenText: "先把报价发给客户，接着去确认合同。等合同确认好后，再回复我。"
+        ),
+        applicationRole: .messaging,
+        expansionRatio: 1.35,
+        lengthBudget: .expansion
+    ).accepted,
+    "事实守卫识别接着确认仍是主动步骤"
+)
+check(
+    FactGuard.audit(
+        sourceText: "这个指标原理上做不到：聚焦前后不能同时保持方形光斑。",
+        result: StructuredRewriteResult(
+            rewrittenText: "这个指标在原理上无法实现，因为聚焦前后无法同时保持方形光斑。"
+        ),
+        applicationRole: .messaging,
+        expansionRatio: 1.35,
+        lengthBudget: .expansion
+    ).accepted,
+    "事实守卫允许展开原文冒号已经明确支持的原理关系"
+)
+check(
+    !FactGuard.audit(
+        sourceText: "光斑还是偏大，具体原因还需要分析。",
+        result: StructuredRewriteResult(
+            rewrittenText: "光斑还是偏大，因为准直镜参数不合适，具体还需要分析。"
+        ),
+        applicationRole: .messaging,
+        expansionRatio: 1.35,
+        lengthBudget: .expansion
+    ).accepted,
+    "原文仅说原因待分析时仍拒绝编造具体原因"
+)
 check(RewriteQualityCorpus.core.count == 40, "润色质量基线包含 40 条脱敏样例")
+check(ExpansionQualityCorpus.core.count == 22, "适当扩写质量基线包含 22 条脱敏样例")
+let adaptivePolishMisses = RewriteQualityCorpus.core.filter {
+    $0.requiresImprovement
+        && AdaptivePolishPolicy.plan(
+            for: $0.sourceText,
+            applicationRole: $0.category == .development ? .development : .messaging
+        ).intensity == .none
+}
+check(
+    adaptivePolishMisses.isEmpty,
+    "自适应预检不会跳过质量基线中明确需要改善的文本"
+)
+check(
+    RewriteQualityCorpus.core
+        .filter { !$0.requiresImprovement }
+        .allSatisfy {
+            AdaptivePolishPolicy.plan(
+                for: $0.sourceText,
+                applicationRole: .messaging
+            ).intensity == .none
+        },
+    "自适应预检会跳过质量基线中无需修改的短消息"
+)
 let qualityCasesRequiringImprovement = RewriteQualityCorpus.core.filter(\.requiresImprovement)
 let retryCoveredQualityCases = qualityCasesRequiringImprovement.filter {
     MessagingRewriteRetryPolicy.shouldRetryUnchanged(
@@ -1570,42 +1935,6 @@ check(
         applicationRole: .messaging
     ).accepted,
     "聊天中的明确赘余可以在不丢信息的前提下大幅精简"
-)
-check(
-    !RewriteHighlightPlanner.plan(
-        sourceText: "无需修改",
-        outputText: "无需修改"
-    ).hasChanges,
-    "相同文本不显示优化高亮"
-)
-let embeddedHighlightPlan = RewriteHighlightPlanner.plan(
-    sourceText: "加电过程中会突然通讯中断，随后一直报错。",
-    outputText: "上电过程中通信会突然中断，随后持续报错。"
-)
-check(
-    embeddedHighlightPlan.hasChanges && embeddedHighlightPlan.changeCount >= 3,
-    "嵌入式术语、语序和搭配修改会形成多处高亮"
-)
-let embeddedHighlightText = "上电过程中通信会突然中断，随后持续报错。" as NSString
-check(
-    embeddedHighlightPlan.ranges.allSatisfy {
-        UTF16TextRangeValidator.isValid($0, forLength: embeddedHighlightText.length)
-    },
-    "所有优化高亮范围都使用有效的结果文本 UTF-16 坐标"
-)
-check(
-    RewriteHighlightPlanner.plan(
-        sourceText: "正文。怎么优化？",
-        outputText: "正文。"
-    ).ranges == [NSRange(location: 3, length: 0)],
-    "纯删除会在结果中的删除位置生成零宽高亮"
-)
-check(
-    RewriteHighlightPlanner.plan(
-        sourceText: "A🙂B",
-        outputText: "A😀B"
-    ).ranges == [NSRange(location: 1, length: 2)],
-    "优化高亮范围正确处理 emoji 的 UTF-16 长度"
 )
 do {
     let decoded = try JSONDecoder().decode(

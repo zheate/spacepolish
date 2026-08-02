@@ -1,12 +1,41 @@
 import Foundation
 
 struct QwenClient {
+    static let defaultModel = "qwen3.7-plus"
     static let temperature = 0.5
     static let enableThinking = false
 
     private let endpoint = URL(
         string: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
     )!
+    private let modelsEndpoint = URL(
+        string: "https://dashscope.aliyuncs.com/compatible-mode/v1/models"
+    )!
+
+    func validateAPIKey(
+        _ apiKey: String,
+        model: String = Self.defaultModel
+    ) async throws {
+        let cleanKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanKey.isEmpty else {
+            throw QwenError.authenticationFailed
+        }
+
+        var request = URLRequest(url: modelsEndpoint)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 12
+        request.setValue("Bearer \(cleanKey)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw QwenError.invalidResponse
+        }
+        try QwenCredentialValidationPolicy.validate(
+            statusCode: httpResponse.statusCode,
+            data: data,
+            requiredModel: model
+        )
+    }
 
     func optimize(
         text: String,
@@ -335,11 +364,57 @@ private struct APIErrorEnvelope: Decodable {
     let error: APIError
 }
 
+private struct ModelListResponse: Decodable {
+    struct Model: Decodable {
+        let id: String
+    }
+
+    let data: [Model]
+}
+
+enum QwenCredentialValidationPolicy {
+    static func validate(
+        statusCode: Int,
+        data: Data,
+        requiredModel: String
+    ) throws {
+        if statusCode == 401 || statusCode == 403 {
+            throw QwenError.authenticationFailed
+        }
+        guard (200...299).contains(statusCode) else {
+            let apiError = try? JSONDecoder().decode(APIErrorEnvelope.self, from: data)
+            throw QwenError.http(
+                statusCode: statusCode,
+                message: apiError?.error.message ?? "通义千问服务返回了错误"
+            )
+        }
+        guard let response = try? JSONDecoder().decode(ModelListResponse.self, from: data) else {
+            throw QwenError.invalidResponse
+        }
+        guard response.data.contains(where: { $0.id == requiredModel }) else {
+            throw QwenError.modelUnavailable(requiredModel)
+        }
+    }
+}
+
 enum QwenError: LocalizedError {
     case invalidResponse
     case http(statusCode: Int, message: String)
+    case authenticationFailed
+    case modelUnavailable(String)
     case emptyResult
     case invalidStructuredResult
+
+    var isAuthenticationFailure: Bool {
+        switch self {
+        case .authenticationFailed:
+            return true
+        case .http(let statusCode, _):
+            return statusCode == 401 || statusCode == 403
+        default:
+            return false
+        }
+    }
 
     var errorDescription: String? {
         switch self {
@@ -347,6 +422,10 @@ enum QwenError: LocalizedError {
             return "没有收到有效的网络响应"
         case .http(let statusCode, let message):
             return "通义千问 API 错误（\(statusCode)）：\(message)"
+        case .authenticationFailed:
+            return "通义千问 API Key 无效或已失效"
+        case .modelUnavailable(let model):
+            return "当前 API Key 无法使用模型 \(model)"
         case .emptyResult:
             return "通义千问返回了空内容"
         case .invalidStructuredResult:

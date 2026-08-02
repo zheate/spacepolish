@@ -3,12 +3,15 @@ import AppKit
 final class AppCoordinator: NSObject, NSMenuDelegate {
     private enum RewriteAction {
         case polish
+        case expand
         case translate
 
         var promptDescription: String {
             switch self {
             case .polish:
                 return "正在优化…"
+            case .expand:
+                return "正在适当扩写…"
             case .translate:
                 return "正在翻译…"
             }
@@ -18,6 +21,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             switch self {
             case .polish:
                 return "polish"
+            case .expand:
+                return "expand"
             case .translate:
                 return "translate"
             }
@@ -25,10 +30,21 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
 
         var progressOperation: InputProgressOperation {
             switch self {
-            case .polish:
+            case .polish, .expand:
                 return .optimization
             case .translate:
                 return .translation
+            }
+        }
+
+        var rewriteMode: RewriteMode? {
+            switch self {
+            case .polish:
+                return .polish
+            case .expand:
+                return .expand
+            case .translate:
+                return nil
             }
         }
     }
@@ -60,7 +76,6 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     private let conversationResolver = ConversationResolver()
     private let monitor = DoubleOptionMonitor()
     private let hud = StatusHUD()
-    private let rewriteHighlightOverlay = RewriteHighlightOverlay()
     private lazy var inputProgressIndicator = InputProgressIndicator(
         isSoundEnabled: { [weak self] in
             self?.model.soundEffectsEnabled ?? false
@@ -73,7 +88,6 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     private var pendingCompletion: PendingCompletion?
     private var progressPositionRetryWorkItem: DispatchWorkItem?
     private var recentRewriteFeedbackContext: RecentRewriteFeedbackContext?
-    private var rewriteHighlightGeneration = 0
     private var activePerformanceTrace: RewritePerformanceTrace?
 
     override init() {
@@ -111,6 +125,9 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     }
 
     func start() {
+        if model.hasAPIKey {
+            validateStoredAPIKey()
+        }
         guard AccessibilityPermission.isTrusted else {
             model.statusText = "等待辅助功能授权"
             AccessibilityPermission.request()
@@ -145,6 +162,15 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         toggle.target = self
         menu.addItem(toggle)
 
+        let expand = NSMenuItem(
+            title: "适当扩写当前文本",
+            action: #selector(expandCurrentText),
+            keyEquivalent: ""
+        )
+        expand.target = self
+        expand.isEnabled = model.canUseAPI && !model.isProcessing
+        menu.addItem(expand)
+
         let settings = NSMenuItem(title: "设置…", action: #selector(openSettings), keyEquivalent: ",")
         settings.target = self
         menu.addItem(settings)
@@ -178,6 +204,9 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
+        let build = NSMenuItem(title: buildDescription, action: nil, keyEquivalent: "")
+        build.isEnabled = false
+        menu.addItem(build)
         let quit = NSMenuItem(title: "退出 Pole", action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
@@ -187,6 +216,14 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         model.isEnabled.toggle()
         try? model.save()
         model.statusText = model.isEnabled ? readyStatusText : "已暂停"
+    }
+
+    @objc private func expandCurrentText() {
+        // Let the status-item menu close and return focus to the original field
+        // before capturing the target text.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            self?.handleTrigger(.expand)
+        }
     }
 
     @objc private func applyRewriteFeedback(_ sender: NSMenuItem) {
@@ -204,6 +241,10 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         if settingsController == nil {
             settingsController = SettingsWindowController(
                 model: model,
+                onValidateAPIKey: { [weak self] key in
+                    guard let self else { throw QwenError.invalidResponse }
+                    try await self.client.validateAPIKey(key)
+                },
                 onSave: { [weak self] in self?.saveSettings() },
                 onRequestPermission: { [weak self] in self?.requestPermission() },
                 onRequestScreenCapturePermission: { [weak self] in
@@ -230,6 +271,9 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
 
     @objc private func applicationDidBecomeActive() {
         settingsController?.refreshPermissionState()
+        if model.hasAPIKey, model.apiConnectionState == .unknown {
+            validateStoredAPIKey()
+        }
         guard AccessibilityPermission.isTrusted, !isMonitorStarted else { return }
         startMonitor()
     }
@@ -267,13 +311,39 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         "左 Option 润色 · 右 Option 翻译"
     }
 
+    private var buildDescription: String {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let version = info["CFBundleShortVersionString"] as? String ?? "开发"
+        let build = info["CFBundleVersion"] as? String ?? "未打包"
+        let commit = (info["PoleBuildCommit"] as? String).map {
+            String($0.prefix(8))
+        } ?? "unknown"
+        let state = info["PoleBuildState"] as? String ?? "local"
+        return "Pole \(version) (\(build)) · \(commit) · \(state)"
+    }
+
     private func handleTrigger(_ action: RewriteAction) {
         guard !model.isProcessing else { return }
+        if let bundleIdentifier = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+           let blockedReason = RewriteTargetSafetyPolicy.blockedReason(
+               bundleIdentifier: bundleIdentifier
+           ) {
+            model.statusText = blockedReason
+            hud.show(blockedReason)
+            return
+        }
         inputProgressIndicator.showFallback(operation: action.progressOperation)
 
-        guard model.hasAPIKey else {
+        guard model.canUseAPI else {
             inputProgressIndicator.fail()
-            model.statusText = "请先设置通义千问 API Key"
+            switch model.apiConnectionState {
+            case .checking:
+                model.statusText = "正在验证通义千问 API Key"
+            case .invalid(let message):
+                model.statusText = message
+            case .unknown, .valid:
+                model.statusText = "请先设置通义千问 API Key"
+            }
             return
         }
 
@@ -295,9 +365,10 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         trace.setInputLength(context.sourceText.count)
         trace.record(.capture, since: captureStartedAt)
 
-        if action == .polish {
-            handlePolishTrigger(context: context)
-        } else {
+        switch action {
+        case .polish, .expand:
+            handlePolishTrigger(context: context, action: action)
+        case .translate:
             beginRewrite(
                 context: context,
                 action: .translate,
@@ -308,21 +379,53 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         }
     }
 
-    private func handlePolishTrigger(context: CapturedTextContext) {
+    private func handlePolishTrigger(
+        context: CapturedTextContext,
+        action: RewriteAction = .polish
+    ) {
         let contextStartedAt = RewritePerformanceTrace.timestamp()
         let snapshot = conversationResolver.resolveCurrentConversation()
         activePerformanceTrace?.record(
             .conversationContext,
             since: contextStartedAt
         )
+        if action == .polish {
+            let applicationContext = snapshot?.applicationContext
+                ?? ApplicationContextClassifier.context(bundleIdentifier: "unknown")
+            let preflightPlan = AdaptivePolishPolicy.plan(
+                for: context.sourceText,
+                applicationRole: applicationContext.role
+            )
+            if !preflightPlan.shouldRequestModel {
+                beginRewrite(
+                    context: context,
+                    action: action,
+                    prompt: "",
+                    conversationSnapshot: snapshot,
+                    communicationContext: nil,
+                    adaptivePolishPlan: preflightPlan
+                )
+                return
+            }
+        }
         if let snapshot,
            !snapshot.applicationContext.supportsConversationProfiles {
-            beginPolish(context: context, snapshot: snapshot, relationship: nil)
+            beginPolish(
+                context: context,
+                snapshot: snapshot,
+                relationship: nil,
+                action: action
+            )
             return
         }
 
         guard let snapshot else {
-            beginPolish(context: context, snapshot: nil, relationship: nil)
+            beginPolish(
+                context: context,
+                snapshot: nil,
+                relationship: nil,
+                action: action
+            )
             return
         }
 
@@ -330,7 +433,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         let needsRefresh = existing?.lastAnalyzedAt.map {
             Date().timeIntervalSince($0) >= 86_400
         } ?? true
-        if model.historyAnalysisEnabled,
+        if action == .polish,
+           model.historyAnalysisEnabled,
            needsRefresh,
            model.helperURL != nil,
            snapshot.normalizedTitle != nil {
@@ -338,14 +442,28 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             return
         }
         if let existing {
-            beginPolish(context: context, snapshot: snapshot, relationship: existing)
+            beginPolish(
+                context: context,
+                snapshot: snapshot,
+                relationship: existing,
+                action: action
+            )
             return
         }
         if let inferred = model.intelligence.createInferredRelationship(for: snapshot) {
-            beginPolish(context: context, snapshot: snapshot, relationship: inferred)
+            beginPolish(
+                context: context,
+                snapshot: snapshot,
+                relationship: inferred,
+                action: action
+            )
             return
         }
-        requestRelationshipOrUseGeneric(context: context, snapshot: snapshot)
+        requestRelationshipOrUseGeneric(
+            context: context,
+            snapshot: snapshot,
+            action: action
+        )
     }
 
     private func prepareHistoryContext(
@@ -450,19 +568,26 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
 
     private func requestRelationshipOrUseGeneric(
         context: CapturedTextContext,
-        snapshot: ConversationSnapshot
+        snapshot: ConversationSnapshot,
+        action: RewriteAction = .polish
     ) {
         // Ordinary chat polishing must remain one gesture. Unknown contacts use
         // the messaging defaults immediately instead of interrupting the first
         // rewrite with relationship setup.
-        beginPolish(context: context, snapshot: snapshot, relationship: nil)
+        beginPolish(
+            context: context,
+            snapshot: snapshot,
+            relationship: nil,
+            action: action
+        )
     }
 
     private func beginPolish(
         context: CapturedTextContext,
         snapshot: ConversationSnapshot?,
         relationship: RelationshipProfile?,
-        progressAlreadyShown: Bool = false
+        progressAlreadyShown: Bool = false,
+        action: RewriteAction = .polish
     ) {
         let voiceMetrics = model.intelligence.voice.metrics(for: relationship?.id)
         let intent = CommunicationIntentAnalyzer.infer(from: context.sourceText)
@@ -487,24 +612,35 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             policy: policy,
             dataConfidence: relationship?.confidence ?? 0
         )
+        let adaptivePolishPlan = action == .polish
+            ? AdaptivePolishPolicy.plan(
+                for: context.sourceText,
+                applicationRole: applicationContext.role
+            )
+            : nil
         beginRewrite(
             context: context,
-            action: .polish,
-            prompt: polishPrompt(
+            action: action,
+            prompt: rewritePrompt(
+                action: action,
                 for: snapshot,
                 sourceText: context.sourceText,
-                conversationInstruction: policy.modelInstruction
+                conversationInstruction: policy.modelInstruction,
+                adaptivePolishPlan: adaptivePolishPlan
             ),
             conversationSnapshot: snapshot,
             communicationContext: communicationContext,
-            progressAlreadyShown: progressAlreadyShown
+            progressAlreadyShown: progressAlreadyShown,
+            adaptivePolishPlan: adaptivePolishPlan
         )
     }
 
-    private func polishPrompt(
+    private func rewritePrompt(
+        action: RewriteAction,
         for snapshot: ConversationSnapshot?,
         sourceText: String,
-        conversationInstruction: String? = nil
+        conversationInstruction: String? = nil,
+        adaptivePolishPlan: AdaptivePolishPlan? = nil
     ) -> String {
         let applicationInstruction = snapshot.flatMap {
             ApplicationContextPolicy.contextInstruction(
@@ -523,10 +659,20 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                 return trimmed.isEmpty ? nil : trimmed
             }
             .joined(separator: "\n")
-        return PromptPolicy.polishPrompt(
-            basePrompt: model.prompt,
-            contextInstruction: contextInstruction.isEmpty ? nil : contextInstruction
-        )
+        switch action {
+        case .polish:
+            return PromptPolicy.polishPrompt(
+                basePrompt: model.prompt,
+                contextInstruction: contextInstruction.isEmpty ? nil : contextInstruction,
+                adaptivePlan: adaptivePolishPlan
+            )
+        case .expand:
+            return PromptPolicy.expansionPrompt(
+                contextInstruction: contextInstruction.isEmpty ? nil : contextInstruction
+            )
+        case .translate:
+            return TranslationPolicy.prompt
+        }
     }
 
     private func showConversationProfilePanel(
@@ -601,17 +747,37 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         prompt: String,
         conversationSnapshot: ConversationSnapshot?,
         communicationContext: CommunicationContext?,
-        progressAlreadyShown: Bool = false
+        progressAlreadyShown: Bool = false,
+        adaptivePolishPlan: AdaptivePolishPlan? = nil
     ) {
-        rewriteHighlightGeneration &+= 1
-        rewriteHighlightOverlay.hide()
         model.isProcessing = true
-        model.statusText = action.promptDescription
+        model.statusText = adaptivePolishPlan?.progressDescription
+            ?? action.promptDescription
         if !progressAlreadyShown {
             showInputProgress(
                 for: context,
-                operation: action == .translate ? .translation : .optimization
+                operation: action.progressOperation
             )
+        }
+
+        if let adaptivePolishPlan,
+           !adaptivePolishPlan.shouldRequestModel {
+            recentRewriteFeedbackContext = nil
+            pendingCompletion = PendingCompletion(
+                context: context,
+                cursorUTF16: context.replacementRange.location
+                    + (context.sourceText as NSString).length,
+                outcome: .unchanged,
+                action: action,
+                retried: false,
+                retryReason: nil
+            )
+            perform(
+                #selector(finishPendingCompletion),
+                with: nil,
+                afterDelay: 0.08
+            )
+            return
         }
 
         let key = model.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -622,8 +788,15 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             let attemptState = RewriteAttemptState()
             do {
                 let result: String
-                if action == .polish,
+                if let rewriteMode = action.rewriteMode,
                    let communicationContext {
+                    let lengthBudget: RewriteLengthBudget?
+                    switch rewriteMode {
+                    case .expand:
+                        lengthBudget = .expansion
+                    case .polish:
+                        lengthBudget = adaptivePolishPlan?.lengthBudget
+                    }
                     let first = StructuredRewriteResult(
                         rewrittenText: try await self.requestOptimization(
                             text: context.sourceText,
@@ -640,7 +813,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         result: first,
                         applicationRole: communicationContext.applicationContext.role,
                         expansionRatio: communicationContext.policy.messageExpansionRatio,
-                        semanticLibraries: self.model.enabledSemanticLibraries
+                        semanticLibraries: self.model.enabledSemanticLibraries,
+                        lengthBudget: lengthBudget
                     )
                     let firstVoiceAudit = VoiceGuard.audit(
                         sourceText: context.sourceText,
@@ -651,12 +825,16 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                     let firstAlignmentAudit = RewriteAlignmentGuard.audit(
                         sourceText: context.sourceText,
                         outputText: first.rewrittenText,
-                        applicationRole: communicationContext.applicationContext.role
+                        applicationRole: communicationContext.applicationContext.role,
+                        rewriteMode: rewriteMode,
+                        lengthBudget: lengthBudget
                     )
                     let firstQualityAudit = RewriteQualityGuard.audit(
                         sourceText: context.sourceText,
                         outputText: first.rewrittenText,
-                        applicationRole: communicationContext.applicationContext.role
+                        applicationRole: communicationContext.applicationContext.role,
+                        rewriteMode: rewriteMode,
+                        lengthBudget: lengthBudget
                     )
                     self.activePerformanceTrace?.record(
                         .firstGuard,
@@ -697,7 +875,8 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                             result: retry,
                             applicationRole: communicationContext.applicationContext.role,
                             expansionRatio: communicationContext.policy.messageExpansionRatio,
-                            semanticLibraries: self.model.enabledSemanticLibraries
+                            semanticLibraries: self.model.enabledSemanticLibraries,
+                            lengthBudget: lengthBudget
                         )
                         let retryVoiceAudit = VoiceGuard.audit(
                             sourceText: context.sourceText,
@@ -708,12 +887,16 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         let retryAlignmentAudit = RewriteAlignmentGuard.audit(
                             sourceText: context.sourceText,
                             outputText: retry.rewrittenText,
-                            applicationRole: communicationContext.applicationContext.role
+                            applicationRole: communicationContext.applicationContext.role,
+                            rewriteMode: rewriteMode,
+                            lengthBudget: lengthBudget
                         )
                         let retryQualityAudit = RewriteQualityGuard.audit(
                             sourceText: context.sourceText,
                             outputText: retry.rewrittenText,
-                            applicationRole: communicationContext.applicationContext.role
+                            applicationRole: communicationContext.applicationContext.role,
+                            rewriteMode: rewriteMode,
+                            lengthBudget: lengthBudget
                         )
                         self.activePerformanceTrace?.record(
                             .retryGuard,
@@ -755,12 +938,6 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         stage: .firstModel
                     )
                 }
-                let highlightPlan = action == .polish
-                    ? RewriteHighlightPlanner.plan(
-                        sourceText: context.sourceText,
-                        outputText: result
-                    )
-                    : RewriteHighlightPlan(ranges: [])
                 try await MainActor.run {
                     let writebackStartedAt = RewritePerformanceTrace.timestamp()
                     if let conversationSnapshot,
@@ -772,15 +949,6 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                         result: result
                     )
                     try self.textService.replace(context: context, with: result)
-                    if highlightPlan.hasChanges {
-                        self.scheduleRewriteHighlights(
-                            plan: highlightPlan,
-                            context: context,
-                            finalCursorUTF16: context.replacementRange.location
-                                + (result as NSString).length,
-                            generation: self.rewriteHighlightGeneration
-                        )
-                    }
                     if action == .polish {
                         let relationshipID = communicationContext?.relationship?.id
                         let historyEntryID: UUID?
@@ -832,6 +1000,10 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                     self.pendingCompletion = nil
                     self.inputProgressIndicator.fail()
                     self.model.isProcessing = false
+                    if let qwenError = error as? QwenError,
+                       qwenError.isAuthenticationFailure {
+                        self.model.markAPIKeyInvalid(qwenError.localizedDescription)
+                    }
                     self.model.statusText = self.failureStatusText(for: error)
                     self.activePerformanceTrace?.finish(
                         outcome: "failed",
@@ -880,71 +1052,6 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             operation: operation,
             remainingDelays: [0.04, 0.12, 0.24]
         )
-    }
-
-    private func scheduleRewriteHighlights(
-        plan: RewriteHighlightPlan,
-        context: CapturedTextContext,
-        finalCursorUTF16: Int,
-        generation: Int
-    ) {
-        let absoluteRanges = plan.ranges.map { range in
-            NSRange(
-                location: context.replacementRange.location + range.location,
-                length: range.length
-            )
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) { [weak self] in
-            self?.attemptToShowRewriteHighlights(
-                ranges: absoluteRanges,
-                changeCount: plan.changeCount,
-                context: context,
-                finalCursorUTF16: finalCursorUTF16,
-                generation: generation,
-                remainingDelays: [0.20, 0.36]
-            )
-        }
-    }
-
-    private func attemptToShowRewriteHighlights(
-        ranges: [NSRange],
-        changeCount: Int,
-        context: CapturedTextContext,
-        finalCursorUTF16: Int,
-        generation: Int,
-        remainingDelays: [TimeInterval]
-    ) {
-        guard rewriteHighlightGeneration == generation,
-              textService.isTargetApplicationFrontmost(for: context) else {
-            return
-        }
-
-        let rects = textService.highlightScreenRects(for: ranges, in: context)
-        if !rects.isEmpty {
-            rewriteHighlightOverlay.show(accessibilityScreenRects: rects)
-            return
-        }
-
-        guard let delay = remainingDelays.first else {
-            rewriteHighlightOverlay.showFallback(
-                at: textService.insertionPointScreenRect(
-                    for: context,
-                    cursorUTF16: finalCursorUTF16
-                ),
-                changeCount: changeCount
-            )
-            return
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            self?.attemptToShowRewriteHighlights(
-                ranges: ranges,
-                changeCount: changeCount,
-                context: context,
-                finalCursorUTF16: finalCursorUTF16,
-                generation: generation,
-                remainingDelays: Array(remainingDelays.dropFirst())
-            )
-        }
     }
 
     private func attemptToShowInputProgress(
@@ -1014,7 +1121,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             guard let self, self.model.isProcessing else { return }
             self.inputProgressIndicator.finish(
                 with: completion.outcome,
-                operation: completion.action == .translate ? .translation : .optimization
+                operation: completion.action.progressOperation
             )
             let outcome = completion.outcome == .unchanged ? "unchanged" : "changed"
             self.activePerformanceTrace?.finish(
@@ -1030,6 +1137,53 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
 
     private func showError(_ message: String) {
         model.statusText = message
+    }
+
+    private func validateStoredAPIKey() {
+        let key = model.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return }
+        model.markAPIKeyChecking()
+        if AccessibilityPermission.isTrusted {
+            model.statusText = "正在验证通义千问 API Key…"
+        }
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.client.validateAPIKey(key)
+                await MainActor.run {
+                    guard key == self.model.apiKey
+                        .trimmingCharacters(in: .whitespacesAndNewlines) else { return }
+                    self.model.markAPIKeyValid()
+                    self.settingsController?.refreshAPIConnectionState()
+                    self.model.statusText = AccessibilityPermission.isTrusted
+                        ? (self.model.isEnabled ? self.readyStatusText : "已暂停")
+                        : "等待辅助功能授权"
+                }
+            } catch {
+                await MainActor.run {
+                    guard key == self.model.apiKey
+                        .trimmingCharacters(in: .whitespacesAndNewlines) else { return }
+                    if let qwenError = error as? QwenError {
+                        switch qwenError {
+                        case .authenticationFailed, .modelUnavailable:
+                            let message = qwenError.localizedDescription
+                            self.model.markAPIKeyInvalid(message)
+                            self.model.statusText = message
+                            self.openSettings()
+                            return
+                        default:
+                            break
+                        }
+                    }
+                    self.model.markAPIKeyUnknown()
+                    self.settingsController?.refreshAPIConnectionState()
+                    if AccessibilityPermission.isTrusted {
+                        self.model.statusText = "暂时无法验证通义千问连接"
+                    }
+                }
+            }
+        }
     }
 
     private func failureStatusText(for error: Error) -> String {

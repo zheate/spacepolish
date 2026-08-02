@@ -1,22 +1,23 @@
-# Pole Settings Design QA
+# Pole Settings Layout QA
 
 - Source visual truth: `/Users/zh/Documents/test/spacepolish/work/qa/spacepolish-settings-broken.png`
 - Implementation screenshot: `/Users/zh/Documents/test/spacepolish/work/qa/spacepolish-settings-fixed.jpeg`
 - Comparison viewport: source 1240 x 1190 Retina capture; implementation 590 x 568 logical capture, also normalized to 1180 x 1136 for comparison
-- State: settings window open, API Key present and masked, DeepSeek Chat selected, trigger interval 1.2 seconds
+- Historical screenshot state: settings window open, API Key present and masked, DeepSeek V4 Flash selected, trigger interval 1.2 seconds
+- Current provider state: the implementation now exposes Qwen 3.7 Plus / Qwen 3.6 Flash; the screenshots below remain layout evidence only and do not verify the current provider copy or connection-validation state.
 
 ## Full-view comparison evidence
 
 The source screenshot is the reported failure state, not a redesign target. Its literal contract is to preserve the existing settings content while eliminating the collapsed group boxes and overlapping text. In the repaired running window:
 
-- The DeepSeek group has a stable, fully visible content region.
+- The provider group has a stable, fully visible content region.
 - The optimization-rules group has a stable, fully visible prompt editor and interval row.
 - The footer is separated from both groups and remains inside the window.
 - The window no longer contains a large blank region caused by collapsed content.
 
 ## Focused-region comparison evidence
 
-A separate crop was not needed: after normalizing scale, the full-view comparison keeps every label and control readable. The DeepSeek and optimization-rules groups were specifically inspected at full resolution.
+A separate crop was not needed: after normalizing scale, the full-view comparison keeps every label and control readable. The provider and optimization-rules groups were specifically inspected at full resolution.
 
 ## Required fidelity surfaces
 
@@ -32,7 +33,7 @@ No actionable P0, P1, or P2 visual issues remain.
 
 ## Interaction checks
 
-- Opened the model picker, selected another option, and restored DeepSeek Chat.
+- The historical capture confirmed that the model picker remained visible and usable; current Qwen labels and API-connection validation are covered by source and automated checks, not by this screenshot set.
 - Changed the trigger-interval slider and restored it to 1.2 seconds.
 - Confirmed the API Key remains masked and all controls are exposed in the accessibility tree.
 
@@ -46,4 +47,4 @@ No actionable P0, P1, or P2 visual issues remain.
 
 None required for this scoped repair.
 
-final result: passed
+final result: historical layout evidence passed; current provider-copy recapture pending

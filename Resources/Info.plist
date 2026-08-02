@@ -20,9 +20,11 @@
     <string>0.2.0</string>
     <key>CFBundleVersion</key>
     <string>5</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>13.0</string>
-    <key>LSUIElement</key>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>LSMultipleInstancesProhibited</key>
+	<true/>
+	<key>LSUIElement</key>
     <true/>
     <key>NSHumanReadableCopyright</key>
     <string>Pole</string>

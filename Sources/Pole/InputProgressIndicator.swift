@@ -1,5 +1,16 @@
 import AppKit
 
+enum InputProgressPalette {
+    // A balanced success green that stays legible after the dark backing
+    // surface fades away, including over white document backgrounds.
+    static let completion = NSColor(
+        calibratedRed: 22 / 255,
+        green: 138 / 255,
+        blue: 69 / 255,
+        alpha: 1
+    )
+}
+
 enum InputProgressOperation {
     case optimization
     case translation
@@ -14,9 +25,6 @@ enum InputProgressSoundCue: Equatable {
         for outcome: OptimizationOutcome,
         operation: InputProgressOperation
     ) -> InputProgressSoundCue {
-        if case .translation = operation {
-            return .completion
-        }
         return outcome == .unchanged ? .unchanged : .completion
     }
 }
@@ -245,7 +253,9 @@ final class InputProgressIndicator {
         }
         let accessibilityDescription: String
         switch (operation, outcome) {
-        case (.translation, _):
+        case (.translation, .unchanged):
+            accessibilityDescription = "无需翻译"
+        case (.translation, .partial), (.translation, .complete):
             accessibilityDescription = "翻译完成"
         case (.optimization, .unchanged):
             accessibilityDescription = "无需修改"
@@ -390,7 +400,16 @@ private final class InputProgressSoundPlayer {
 
     func play(_ cue: InputProgressSoundCue) {
         activeSound?.stop()
-        guard let sound = NSSound(named: cue.soundName) else { return }
+        let bundledSound = cue.resourceName.flatMap { resourceName in
+            Bundle.main.url(
+                forResource: resourceName,
+                withExtension: "mp3",
+                subdirectory: "Sounds"
+            ).flatMap { NSSound(contentsOf: $0, byReference: false) }
+        }
+        guard let sound = bundledSound ?? NSSound(named: cue.fallbackSoundName) else {
+            return
+        }
         sound.volume = cue.volume
         activeSound = sound
         sound.play()
@@ -398,7 +417,16 @@ private final class InputProgressSoundPlayer {
 }
 
 extension InputProgressSoundCue {
-    var soundName: NSSound.Name {
+    var resourceName: String? {
+        switch self {
+        case .completion:
+            return "uisfx-minimal-complete"
+        case .unchanged, .failure:
+            return nil
+        }
+    }
+
+    var fallbackSoundName: NSSound.Name {
         switch self {
         case .completion:
             return NSSound.Name("Glass")
@@ -412,7 +440,7 @@ extension InputProgressSoundCue {
     var volume: Float {
         switch self {
         case .completion:
-            return 0.32
+            return 0.24
         case .unchanged:
             return 0.20
         case .failure:
@@ -422,13 +450,6 @@ extension InputProgressSoundCue {
 }
 
 private enum IndicatorVisualState {
-    private static let completionColor = NSColor(
-        calibratedRed: 1.0,
-        green: 0.8157,
-        blue: 0,
-        alpha: 1
-    )
-
     case changed
     case unchanged
     case failed
@@ -447,7 +468,7 @@ private enum IndicatorVisualState {
     var color: NSColor {
         switch self {
         case .changed:
-            return Self.completionColor
+            return InputProgressPalette.completion
         case .unchanged:
             return NSColor(calibratedWhite: 0.82, alpha: 1)
         case .failed:

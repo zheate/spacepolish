@@ -192,7 +192,6 @@ enum KeyboardTextCommitPlanner {
 }
 
 enum KeyboardFallbackPolicy {
-    // 终端应用按用户要求允许键盘回退；写回依赖模拟粘贴，多行文本会被终端当作命令执行，风险由用户承担。
     private static let excludedBundleIdentifiers: Set<String> = [
         "com.spacepolish.mac"
     ]
@@ -204,6 +203,7 @@ enum KeyboardFallbackPolicy {
 
     static func allows(bundleIdentifier: String) -> Bool {
         !excludedBundleIdentifiers.contains(bundleIdentifier.lowercased())
+            && RewriteTargetSafetyPolicy.allowsRewrite(bundleIdentifier: bundleIdentifier)
     }
 
     static func shouldRetryCapture(
@@ -390,49 +390,6 @@ private enum AccessibilityCaretLocator {
             preferredLocation: preferredLocation,
             fallbackLocation: fallbackLocation
         )
-    }
-
-    static func screenRects(
-        on element: AXUIElement,
-        ranges: [NSRange]
-    ) -> [CGRect] {
-        ranges.compactMap { range in
-            guard range.location >= 0, range.length >= 0 else { return nil }
-            if range.length == 0 {
-                return screenRect(at: range.location, on: element)
-            }
-            return bounds(
-                for: CFRange(location: range.location, length: range.length),
-                on: element
-            )
-        }
-    }
-
-    static func focusedScreenRects(
-        processIdentifier: pid_t,
-        ranges: [NSRange]
-    ) -> [CGRect] {
-        let systemWide = AXUIElementCreateSystemWide()
-        var focusedRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            systemWide,
-            kAXFocusedUIElementAttribute as CFString,
-            &focusedRef
-        ) == .success,
-              let focusedRef else {
-            return []
-        }
-
-        let focusedElement = focusedRef as! AXUIElement
-        var focusedProcessIdentifier: pid_t = 0
-        guard AXUIElementGetPid(
-            focusedElement,
-            &focusedProcessIdentifier
-        ) == .success,
-              focusedProcessIdentifier == processIdentifier else {
-            return []
-        }
-        return screenRects(on: focusedElement, ranges: ranges)
     }
 
     private static func selectedTextRange(on element: AXUIElement) -> CFRange? {
@@ -756,55 +713,6 @@ struct AccessibilityTextService {
                 preferredLocation: cursorUTF16,
                 fallbackLocation: context.cursorUTF16
             )
-        }
-    }
-
-    func highlightScreenRects(
-        for ranges: [NSRange],
-        in context: CapturedTextContext
-    ) -> [CGRect] {
-        guard !ranges.isEmpty,
-              isTargetApplicationFrontmost(for: context) else {
-            return []
-        }
-
-        switch context.target {
-        case .accessibility(let element):
-            let direct = AccessibilityCaretLocator.screenRects(
-                on: element,
-                ranges: ranges
-            )
-            if !direct.isEmpty { return direct }
-
-            var processIdentifier: pid_t = 0
-            guard AXUIElementGetPid(element, &processIdentifier) == .success else {
-                return []
-            }
-            return AccessibilityCaretLocator.focusedScreenRects(
-                processIdentifier: processIdentifier,
-                ranges: ranges
-            )
-        case .keyboard(let processIdentifier):
-            return AccessibilityCaretLocator.focusedScreenRects(
-                processIdentifier: processIdentifier,
-                ranges: ranges
-            )
-        }
-    }
-
-    func isTargetApplicationFrontmost(for context: CapturedTextContext) -> Bool {
-        guard let frontmostProcessIdentifier = NSWorkspace.shared
-            .frontmostApplication?
-            .processIdentifier else {
-            return false
-        }
-        switch context.target {
-        case .accessibility(let element):
-            var processIdentifier: pid_t = 0
-            return AXUIElementGetPid(element, &processIdentifier) == .success
-                && processIdentifier == frontmostProcessIdentifier
-        case .keyboard(let processIdentifier):
-            return processIdentifier == frontmostProcessIdentifier
         }
     }
 
