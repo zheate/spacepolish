@@ -2065,12 +2065,12 @@ check(
     "原样候选没有处理明确标点问题时会重试"
 )
 check(
-    !RewriteQualityGuard.audit(
+    RewriteQualityGuard.audit(
         sourceText: "这个问题我再确认一下。",
         outputText: "现将该问题的确认情况同步如下。",
         applicationRole: .messaging
-    ).accepted,
-    "质量门拒绝把聊天改成工作汇报"
+    ).warnings.contains(where: { $0.contains("工作汇报") }),
+    "质量门把聊天工作汇报腔降级为软警告"
 )
 check(
     !RewriteQualityGuard.audit(
@@ -2133,14 +2133,14 @@ check(
     "扩写质量门接受长度适中且忠实的成稿"
 )
 check(
-    !RewriteQualityGuard.audit(
+    RewriteQualityGuard.audit(
         sourceText: "这个指标还不能确认，需要验证后才能给结论。",
         outputText: String(repeating: "这个指标仍需验证后再确认。", count: 8),
         applicationRole: .messaging,
         rewriteMode: .expand,
         lengthBudget: .expansion
-    ).accepted,
-    "扩写质量门拒绝通过重复内容突破长度预算"
+    ).warnings.contains("候选扩写超过当前模式允许的长度"),
+    "扩写质量门把超出长度预算记录为软警告"
 )
 check(
     !RewriteQualityGuard.audit(
@@ -2163,16 +2163,19 @@ check(
     "明显并列层级允许使用编号和适当换行"
 )
 check(
-    !FactGuard.audit(
+    FactGuard.audit(
         sourceText: "这个指标还不能确认，需要验证后才能给结论。",
         result: StructuredRewriteResult(
-            rewrittenText: String(repeating: "这个指标仍需验证后再确认。", count: 8)
+            rewrittenText: String(
+                repeating: "这个指标还不能确认，需要验证后才能给结论。",
+                count: 8
+            )
         ),
         applicationRole: .messaging,
         expansionRatio: 1.35,
         lengthBudget: .expansion
     ).accepted,
-    "事实守卫执行扩写模式的独立最大长度预算"
+    "事实守卫不再把长度偏差当作事实风险"
 )
 check(
     !FactGuard.audit(
@@ -2410,6 +2413,85 @@ check(
     ).accepted,
     "声音守卫拒绝模板化正式话术"
 )
+
+let softWarningAudit = waitForAsync {
+    await RewritePipeline().audit(
+        sourceText: "这个我再看看",
+        result: StructuredRewriteResult(
+            rewrittenText: "尊敬的领导，烦请知悉此事项。"
+        ),
+        applicationRole: .messaging,
+        expansionRatio: 1.35,
+        semanticLibraries: SemanticLibraryID.defaultEnabled,
+        expectedVoice: VoiceMetrics(),
+        rewriteMode: .polish,
+        lengthBudget: nil,
+        expansionPlan: nil
+    )
+}
+if case .success(let audit) = softWarningAudit {
+    check(
+        audit.isSafe
+            && audit.isQualityAccepted
+            && audit.retryIssues.isEmpty
+            && audit.guardHits.contains("voice_warning")
+            && audit.guardHits.contains("quality_warning"),
+        "语气和正式度偏差只记录软警告，不再触发拒绝或重试"
+    )
+} else {
+    check(false, "语气软警告审计可以完成")
+}
+
+let hardSafetyAudit = waitForAsync {
+    await RewritePipeline().audit(
+        sourceText: "项目可能延期两周。",
+        result: StructuredRewriteResult(rewrittenText: "项目已经延期两周。"),
+        applicationRole: .messaging,
+        expansionRatio: 1.35,
+        semanticLibraries: SemanticLibraryID.defaultEnabled,
+        expectedVoice: VoiceMetrics(),
+        rewriteMode: .polish,
+        lengthBudget: nil,
+        expansionPlan: nil
+    )
+}
+if case .success(let audit) = hardSafetyAudit {
+    check(
+        !audit.isSafe
+            && !audit.retryIssues.isEmpty
+            && audit.guardHits == ["fact"],
+        "确定性变化仍作为事实风险硬拒绝并进入重试"
+    )
+} else {
+    check(false, "事实风险审计可以完成")
+}
+
+let qualityRetryAudit = waitForAsync {
+    await RewritePipeline().audit(
+        sourceText: "BOM 还没确认，等规格定了再算成本。",
+        result: StructuredRewriteResult(
+            rewrittenText: "BOM 还没确认，等规格定了再算成本。"
+        ),
+        applicationRole: .messaging,
+        expansionRatio: 1.35,
+        semanticLibraries: SemanticLibraryID.defaultEnabled,
+        expectedVoice: VoiceMetrics(),
+        rewriteMode: .expand,
+        lengthBudget: .expansion,
+        expansionPlan: nil
+    )
+}
+if case .success(let audit) = qualityRetryAudit {
+    check(
+        audit.isSafe
+            && !audit.isQualityAccepted
+            && audit.retryIssues.count == 1
+            && audit.guardHits == ["quality"],
+        "质量重试只传一条可执行问题，不混入语气和长度警告"
+    )
+} else {
+    check(false, "质量重试审计可以完成")
+}
 
 do {
     let tempDirectory = FileManager.default.temporaryDirectory

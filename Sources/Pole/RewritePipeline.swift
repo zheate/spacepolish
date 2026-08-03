@@ -8,16 +8,35 @@ struct RewriteAuditBundle: @unchecked Sendable {
     let contextual: ContextualExpansionAuditResult?
 
     var isSafe: Bool {
-        fact.accepted && voice.accepted && alignment.accepted
+        fact.accepted && alignment.accepted
     }
 
     var isQualityAccepted: Bool {
         quality.accepted && (contextual?.accepted ?? true)
     }
 
-    var issues: [String] {
+    var retryIssues: [String] {
+        if !isSafe {
+            return fact.issues + alignment.issues
+        }
+        return Array(
+            (quality.issues + (contextual?.issues ?? [])).prefix(1)
+        )
+    }
+
+    var guardHits: [String] {
+        var hits: [String] = []
+        if !fact.accepted { hits.append("fact") }
+        if !alignment.accepted { hits.append("alignment") }
+        if !quality.accepted { hits.append("quality") }
+        if contextual?.accepted == false { hits.append("contextual") }
+        if !voice.accepted { hits.append("voice_warning") }
+        if !quality.warnings.isEmpty { hits.append("quality_warning") }
+        return hits
+    }
+
+    var blockingIssues: [String] {
         fact.issues
-            + voice.issues
             + alignment.issues
             + quality.issues
             + (contextual?.issues ?? [])

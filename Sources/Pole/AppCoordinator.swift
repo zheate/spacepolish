@@ -55,6 +55,7 @@ package final class AppCoordinator: NSObject, NSMenuDelegate {
         let action: RewriteAction
         let retried: Bool
         let retryReason: String?
+        let guardHits: [String]
     }
 
     private struct RecentRewriteFeedbackContext {
@@ -66,6 +67,7 @@ package final class AppCoordinator: NSObject, NSMenuDelegate {
     private final class RewriteAttemptState: @unchecked Sendable {
         var retried = false
         var retryReason: String?
+        var guardHits: [String] = []
     }
 
     let model = AppModel()
@@ -949,7 +951,8 @@ package final class AppCoordinator: NSObject, NSMenuDelegate {
                 outcome: .unchanged,
                 action: action,
                 retried: false,
-                retryReason: nil
+                retryReason: nil,
+                guardHits: []
             )
             perform(
                 #selector(finishPendingCompletion),
@@ -1005,6 +1008,7 @@ package final class AppCoordinator: NSObject, NSMenuDelegate {
                     )
                     let firstWasSafe = firstAudit.isSafe
                     let firstWasQualityAccepted = firstAudit.isQualityAccepted
+                    attemptState.guardHits = firstAudit.guardHits
                     let firstWasAccepted = firstWasSafe && firstWasQualityAccepted
                     if firstWasAccepted {
                         result = first.rewrittenText
@@ -1017,14 +1021,13 @@ package final class AppCoordinator: NSObject, NSMenuDelegate {
                         } else {
                             attemptState.retryReason = "quality"
                         }
-                        let issues = firstAudit.issues
                         let retry = StructuredRewriteResult(
                             rewrittenText: try await self.requestOptimization(
                                 text: context.sourceText,
                                 apiKey: key,
                                 model: selectedModel,
                                 prompt: prompt,
-                                retryIssues: issues,
+                                retryIssues: firstAudit.retryIssues,
                                 stage: .retryModel
                             )
                         )
@@ -1044,6 +1047,7 @@ package final class AppCoordinator: NSObject, NSMenuDelegate {
                             .retryGuard,
                             since: retryGuardStartedAt
                         )
+                        attemptState.guardHits = retryAudit.guardHits
                         if retryAudit.isSafe, retryAudit.isQualityAccepted {
                             result = retry.rewrittenText
                         } else if firstWasSafe,
@@ -1064,19 +1068,13 @@ package final class AppCoordinator: NSObject, NSMenuDelegate {
                             }
                             result = first.rewrittenText
                         } else {
-                            let retrySafetyIssues = retryAudit.fact.issues
-                                + retryAudit.voice.issues
-                                + retryAudit.alignment.issues
-                            if retrySafetyIssues.isEmpty {
+                            if retryAudit.isSafe {
                                 throw RewriteSafetyError.qualityRejected(
-                                    retryAudit.quality.issues
-                                        + (retryAudit.contextual?.issues ?? [])
+                                    retryAudit.blockingIssues
                                 )
                             }
                             throw RewriteSafetyError.rejected(
-                                retrySafetyIssues
-                                    + retryAudit.quality.issues
-                                    + (retryAudit.contextual?.issues ?? [])
+                                retryAudit.blockingIssues
                             )
                         }
                     }
@@ -1137,7 +1135,8 @@ package final class AppCoordinator: NSObject, NSMenuDelegate {
                         outcome: outcome,
                         action: action,
                         retried: attemptState.retried,
-                        retryReason: attemptState.retryReason
+                        retryReason: attemptState.retryReason,
+                        guardHits: attemptState.guardHits
                     )
                     self.activePerformanceTrace?.record(
                         .writeback,
@@ -1172,7 +1171,9 @@ package final class AppCoordinator: NSObject, NSMenuDelegate {
                     self.activePerformanceTrace?.finish(
                         outcome: "failed",
                         retried: attemptState.retried,
-                        retryReason: attemptState.retryReason
+                        retryReason: attemptState.retryReason,
+                        failureReason: self.performanceFailureReason(for: error),
+                        guardHits: attemptState.guardHits
                     )
                     self.activePerformanceTrace = nil
                 }
@@ -1323,7 +1324,8 @@ package final class AppCoordinator: NSObject, NSMenuDelegate {
         activePerformanceTrace?.finish(
             outcome: outcome,
             retried: completion.retried,
-            retryReason: completion.retryReason
+            retryReason: completion.retryReason,
+            guardHits: completion.guardHits
         )
         activePerformanceTrace = nil
         rewriteCoordinator.finish()
@@ -1396,5 +1398,16 @@ package final class AppCoordinator: NSObject, NSMenuDelegate {
             return "上次失败：\(qwenError.localizedDescription)"
         }
         return "上次失败：\(error.localizedDescription)"
+    }
+
+    private func performanceFailureReason(for error: Error) -> String {
+        if error is RewriteSafetyError { return "guard_reject" }
+        if error is TextEditingError { return "writeback_failed" }
+        if error is ConversationContextError { return "conversation_failed" }
+        if let urlError = error as? URLError, urlError.code == .timedOut {
+            return "model_timeout"
+        }
+        if error is QwenError || error is URLError { return "model_failed" }
+        return "unknown_failed"
     }
 }

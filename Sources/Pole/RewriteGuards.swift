@@ -61,6 +61,7 @@ struct RewriteAlignmentAuditResult: Equatable {
 struct RewriteQualityAuditResult: Equatable {
     let accepted: Bool
     let issues: [String]
+    let warnings: [String]
     let meaningfullyChanged: Bool
 }
 
@@ -134,9 +135,9 @@ enum FactGuard {
         sourceText: String,
         result: StructuredRewriteResult,
         applicationRole: ApplicationWritingRole,
-        expansionRatio: Double,
+        expansionRatio _: Double,
         semanticLibraries: Set<SemanticLibraryID> = SemanticLibraryID.defaultEnabled,
-        lengthBudget: RewriteLengthBudget? = nil
+        lengthBudget _: RewriteLengthBudget? = nil
     ) -> FactAuditResult {
         let output = result.rewrittenText
         var issues: [String] = []
@@ -199,19 +200,6 @@ enum FactGuard {
         for anchor in protectedClaimAnchors(in: sourceText)
             where !output.localizedCaseInsensitiveContains(anchor) {
             issues.append("输出删除了对象或受益人：\(anchor)")
-        }
-
-        if let lengthBudget {
-            let maximumLength = lengthBudget.maximumCharacters(for: sourceText.count)
-            if output.count > maximumLength {
-                issues.append("输出扩写超过当前模式的长度预算")
-            }
-        } else if applicationRole == .messaging {
-            let maximumLength = Int(ceil(Double(max(sourceText.count, 1)) * expansionRatio))
-                + 12
-            if output.count > maximumLength {
-                issues.append("聊天消息扩写超过预算")
-            }
         }
 
         if [.development, .aiDevelopmentAssistant].contains(applicationRole) {
@@ -610,6 +598,7 @@ enum RewriteQualityGuard {
         let output = normalized(outputText)
         let changed = source != output
         var issues: [String] = []
+        var warnings: [String] = []
 
         if rewriteMode == .polish,
            !changed,
@@ -638,7 +627,7 @@ enum RewriteQualityGuard {
 
         if let lengthBudget,
            output.count > lengthBudget.maximumCharacters(for: source.count) {
-            issues.append("候选扩写超过当前模式允许的长度")
+            warnings.append("候选扩写超过当前模式允许的长度")
         }
 
         if applicationRole == .messaging {
@@ -648,18 +637,18 @@ enum RewriteQualityGuard {
             }
             for phrase in reportStylePhrases
                 where output.contains(phrase) && !source.contains(phrase) {
-                issues.append("输出引入了工作汇报或公文式表达：\(phrase)")
+                warnings.append("输出引入了工作汇报或公文式表达：\(phrase)")
             }
             if source.count <= 48,
                !source.contains("\n"),
                output.contains("\n"),
                !ParallelListPolicy.shouldPreferNumberedList(source) {
-                issues.append("简短聊天被扩写成了分段文本")
+                warnings.append("简短聊天被扩写成了分段文本")
             }
             if lengthBudget == nil,
                source.count >= 8,
                output.count > max(source.count + 20, Int(Double(source.count) * 1.65)) {
-                issues.append("聊天结果扩写过多，不像原有表达节奏")
+                warnings.append("聊天结果扩写过多，不像原有表达节奏")
             }
         }
 
@@ -671,6 +660,7 @@ enum RewriteQualityGuard {
         return RewriteQualityAuditResult(
             accepted: issues.isEmpty,
             issues: Array(issues.prefix(3)),
+            warnings: Array(warnings.prefix(3)),
             meaningfullyChanged: changed
         )
     }
