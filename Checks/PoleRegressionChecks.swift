@@ -1,5 +1,5 @@
-import AppKit
 import Foundation
+import AppKit
 #if SWIFT_PACKAGE
 @testable import PoleCore
 #endif
@@ -2730,10 +2730,3 @@ if failures > 0 {
 }
 return failures
 }
-
-#if POLE_STANDALONE_CHECKS
-let result = runPoleRegressionChecks()
-if result > 0 {
-    exit(1)
-}
-#endif

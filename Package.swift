@@ -36,15 +36,15 @@ let package = Package(
             name: "PoleQualityEvaluation",
             dependencies: ["PoleCore"],
             path: "Checks",
-            exclude: ["main.swift", "PoleRegressionTests.swift"],
+            exclude: ["PoleRegressionChecks.swift", "PoleRegressionTests.swift", "StandaloneCheckMain.swift"],
             sources: ["QualityEvaluationMain.swift"]
         ),
         .testTarget(
             name: "PoleCoreTests",
             dependencies: ["PoleCore"],
             path: "Checks",
-            exclude: ["QualityEvaluationMain.swift"],
-            sources: ["main.swift", "PoleRegressionTests.swift"]
+            exclude: ["QualityEvaluationMain.swift", "StandaloneCheckMain.swift"],
+            sources: ["PoleRegressionChecks.swift", "PoleRegressionTests.swift"]
         )
     ]
 )

@@ -21,7 +21,6 @@ for source in Sources/Pole/*.swift; do
 done
 
 swiftc \
-    -D POLE_STANDALONE_CHECKS \
     -package-name spacepolish \
     -target "$(uname -m)-apple-macos13.0" \
     -framework AppKit \
@@ -29,6 +28,7 @@ swiftc \
     -framework Vision \
     -framework Security \
     "${CORE_SOURCES[@]}" \
-    Checks/main.swift \
+    Checks/PoleRegressionChecks.swift \
+    Checks/StandaloneCheckMain.swift \
     -o "$CHECK_BINARY"
 "$CHECK_BINARY"
