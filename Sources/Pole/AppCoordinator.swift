@@ -1050,10 +1050,20 @@ package final class AppCoordinator: NSObject, NSMenuDelegate {
                             result = retry.rewrittenText
                         } else if firstWasSafe,
                                   !firstAudit.quality.meaningfullyChanged {
-                            // If both attempts fail to produce a safe improvement,
-                            // preserving the user's original text is the only honest
-                            // fallback. It remains classified as unchanged rather than
-                            // being presented as a successful rewrite.
+                            // Both attempts produced no meaningful change. If the
+                            // source clearly had improvement reasons, surface an
+                            // honest quality failure instead of silently writing the
+                            // original text back (which looks like the app ignored the
+                            // request). Otherwise the source was already close to
+                            // optimal and preserving the original is the honest
+                            // fallback; it remains classified as unchanged.
+                            if !MessagingRewriteRetryPolicy.improvementReasons(
+                                in: context.sourceText
+                            ).isEmpty {
+                                throw RewriteSafetyError.qualityRejected(
+                                    [MessagingRewriteRetryPolicy.unchangedIssue]
+                                )
+                            }
                             result = first.rewrittenText
                         } else {
                             let retrySafetyIssues = retryAudit.fact.issues

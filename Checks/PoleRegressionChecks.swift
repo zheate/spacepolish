@@ -820,18 +820,46 @@ let punctuatedReplyPolishPlan = AdaptivePolishPolicy.plan(
 check(
     noChangePolishPlan.intensity == .none
         && !noChangePolishPlan.shouldRequestModel
-        && naturalCommandPolishPlan.intensity == .none
         && punctuatedReplyPolishPlan.intensity == .none,
-    "自然短回复和完整短指令直接判定为无需修改"
+    "自然短回复直接判定为无需修改"
+)
+check(
+    naturalCommandPolishPlan.intensity == .standard,
+    "完整短指令不再预判为无需修改"
 )
 let lightPolishPlan = AdaptivePolishPolicy.plan(
-    for: "这个结果不对，，麻烦再检查一下",
+    for: "这个结果不太对",
     applicationRole: .messaging
 )
 check(
     lightPolishPlan.intensity == .light
         && lightPolishPlan.shouldRequestModel,
-    "明确但局部的标点问题使用轻量润色"
+    "极短且无分隔符的文本使用轻量润色"
+)
+let standardPunctuationPlan = AdaptivePolishPolicy.plan(
+    for: "这个结果不对，，麻烦再检查一下",
+    applicationRole: .messaging
+)
+check(
+    standardPunctuationPlan.intensity == .standard,
+    "明确但局部的标点问题使用标准润色"
+)
+let ordinaryShortCommandPlan = AdaptivePolishPolicy.plan(
+    for: "这个文件你改一下",
+    applicationRole: .messaging
+)
+check(
+    ordinaryShortCommandPlan.shouldRequestModel
+        && ordinaryShortCommandPlan.intensity == .light,
+    "普通短指令不再被预判为无需修改"
+)
+let commaShortMessagePlan = AdaptivePolishPolicy.plan(
+    for: "这个结果不对，麻烦再检查一下",
+    applicationRole: .messaging
+)
+check(
+    commaShortMessagePlan.intensity == .standard,
+    "带分句的短消息使用标准润色"
 )
 let standardPolishPlan = AdaptivePolishPolicy.plan(
     for: "这个方案目前的问题是定位不够清楚，而且信息层级也比较乱，需要重新梳理一下。",
@@ -861,7 +889,7 @@ let adaptiveLightPrompt = PromptPolicy.polishPrompt(
 )
 check(
     adaptiveLightPrompt.contains("当前润色强度：轻量")
-        && adaptiveLightPrompt.contains("不要拆句、扩写、重构")
+        && adaptiveLightPrompt.contains("允许做一处能提升清晰度或自然度的小幅改写")
         && adaptiveLightPrompt.contains("以本段规定的修改幅度为准"),
     "自适应强度作为末端规则约束模型修改幅度"
 )
@@ -1053,8 +1081,11 @@ check(
         && PromptPolicy.currentDefault.contains("BOM 里局部镀")
         && PromptPolicy.currentDefault.contains("发现多个问题时全部处理")
         && PromptPolicy.currentDefault.contains("有明确改进空间时必须给出真正改善后的版本")
-        && PromptPolicy.currentDefault.contains("才可以原样返回")
-        && !PromptPolicy.currentDefault.contains("优先原样输出"),
+        && PromptPolicy.currentDefault.contains("默认给出经过优化的版本")
+        && PromptPolicy.currentDefault.contains("必须至少完成一处能够提升清晰度、准确性或自然度的有效修改")
+        && PromptPolicy.currentDefault.contains("才原样返回")
+        && !PromptPolicy.currentDefault.contains("优先原样输出")
+        && !PromptPolicy.currentDefault.contains("可以原样返回"),
     "新版提示词兼顾信息保留和主动有效修改"
 )
 let opticsSemanticMatches = SemanticLibraryCatalog.matches(
@@ -2019,6 +2050,30 @@ check(
         applicationRole: .messaging
     ).accepted,
     "质量门允许已经自然的短消息保持不变"
+)
+check(
+    RewriteQualityGuard.audit(
+        sourceText: "这个方案我再看看",
+        outputText: "这个方案我再看看",
+        applicationRole: .email
+    ).accepted,
+    "自然完整短消息在邮件场景仍允许保持不变"
+)
+check(
+    !RewriteQualityGuard.audit(
+        sourceText: "这个结果不对，，麻烦再检查一下！！",
+        outputText: "这个结果不对，，麻烦再检查一下！！",
+        applicationRole: .email
+    ).accepted,
+    "邮件场景下原样返回且存在明确问题时触发重试"
+)
+check(
+    !RewriteQualityGuard.audit(
+        sourceText: "这个结果不对，，麻烦再检查一下！！",
+        outputText: "这个结果不对，，麻烦再检查一下！！",
+        applicationRole: .document
+    ).accepted,
+    "文档场景下原样返回且存在明确问题时触发重试"
 )
 check(
     !RewriteQualityGuard.audit(

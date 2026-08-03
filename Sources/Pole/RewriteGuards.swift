@@ -479,7 +479,7 @@ enum AdaptivePolishIntensity: String, Equatable, Sendable {
         case .none:
             return nil
         case .light:
-            return .polish(maximumRatio: 1.15)
+            return .polish(maximumRatio: 1.25)
         case .standard:
             return .polish(maximumRatio: 1.35)
         case .strong:
@@ -511,11 +511,11 @@ struct AdaptivePolishPlan: Equatable, Sendable {
             scopeInstruction = "原文已经完整、自然且可直接使用，必须逐字原样返回。"
         case .light:
             scopeInstruction = """
-            只处理能够明确指出的错字、标点、搭配、重复或编辑指令。尽量保留原句顺序、长度、语气和自然省略；除非修复问题确有必要，不要拆句、扩写、重构或替换本来正确的词。复核后若没有真实问题，原样返回。
+            优先处理错字、标点、搭配、重复或编辑指令；在保持原意、事实、语气和长度基本不变的前提下，允许做一处能提升清晰度或自然度的小幅改写。复核后若逐项确认原文已经自然、准确且可直接使用，才原样返回。
             """
         case .standard:
             scopeInstruction = """
-            处理所有真实表达问题，允许做必要的局部改写、语序调整或拆句，但不要整体换一种说法，也不要扩大原文信息。修改幅度应与问题数量相匹配；复核后若没有真实问题，可以原样返回。
+            处理所有真实表达问题，允许做必要的局部改写、语序调整或拆句，但不要整体换一种说法，也不要扩大原文信息。修改幅度应与问题数量相匹配；复核后只有逐项确认原文已经自然、准确、清楚且可直接使用，才原样返回。
             """
         case .strong:
             scopeInstruction = """
@@ -572,20 +572,26 @@ enum AdaptivePolishPolicy {
             )
         }
 
-        if MessagingRewriteRetryPolicy.isNaturallyCompleteShortMessage(source)
-            || (source.count <= 12
-                && issueReasons.isEmpty
-                && isStructurallySimpleShortText(source)) {
+        if MessagingRewriteRetryPolicy.isNaturallyCompleteShortMessage(source) {
             return AdaptivePolishPlan(
                 intensity: .none,
-                reasons: ["短文本表达完整，未发现明确问题"]
+                reasons: ["自然完整的短回复"]
+            )
+        }
+        if source.count <= 6,
+           issueReasons.isEmpty,
+           paragraphCount <= 1,
+           separatorCount == 0 {
+            return AdaptivePolishPlan(
+                intensity: .none,
+                reasons: ["极短文本未发现明确问题"]
             )
         }
 
         if !issueReasons.isEmpty {
-            let intensity: AdaptivePolishIntensity = source.count <= 24
+            let intensity: AdaptivePolishIntensity = source.count <= 18
                 && paragraphCount <= 1
-                && separatorCount <= 2
+                && separatorCount <= 1
                 ? .light
                 : .standard
             return AdaptivePolishPlan(
@@ -594,9 +600,9 @@ enum AdaptivePolishPolicy {
             )
         }
 
-        if source.count <= 24,
+        if source.count <= 18,
            paragraphCount <= 1,
-           separatorCount <= 1 {
+           separatorCount == 0 {
             return AdaptivePolishPlan(
                 intensity: .light,
                 reasons: ["短文本只需要局部检查"]
@@ -634,14 +640,6 @@ enum AdaptivePolishPolicy {
         var seen: Set<String> = []
         return reasons.filter { seen.insert($0).inserted }
     }
-
-    private static func isStructurallySimpleShortText(_ source: String) -> Bool {
-        var body = source
-        if let last = body.last, "。.!！?？".contains(last) {
-            body.removeLast()
-        }
-        return !body.contains(where: { "，,；;：:。！？!?".contains($0) })
-    }
 }
 
 enum RewriteQualityGuard {
@@ -663,7 +661,6 @@ enum RewriteQualityGuard {
         var issues: [String] = []
 
         if rewriteMode == .polish,
-           applicationRole == .messaging,
            !changed,
            MessagingRewriteRetryPolicy.shouldRetryUnchanged(
                sourceText: sourceText,
