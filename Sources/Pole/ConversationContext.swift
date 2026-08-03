@@ -596,9 +596,10 @@ final class ConversationResolver: @unchecked Sendable {
             )
         }
 
-        let ocrCandidate = window.identifier.flatMap {
-            ocrCandidate(
-                windowIdentifier: $0,
+        let ocrCandidate: ConversationTitleCandidate? = window.identifier.flatMap {
+            windowIdentifier in
+            self.ocrCandidate(
+                windowIdentifier: windowIdentifier,
                 applicationName: application.localizedName
             )
         }

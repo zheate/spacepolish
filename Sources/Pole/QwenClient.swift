@@ -236,8 +236,8 @@ enum RewriteResultPolicy {
             return resultCore
         }
 
-        let leadingWhitespace = sourceText.prefix(while: \Character.isWhitespace)
-        let trailingWhitespace = sourceText.reversed().prefix(while: \Character.isWhitespace)
+        let leadingWhitespace = sourceText.prefix(while: { $0.isWhitespace })
+        let trailingWhitespace = sourceText.reversed().prefix(while: { $0.isWhitespace })
         return String(leadingWhitespace)
             + resultCore
             + String(trailingWhitespace.reversed())
