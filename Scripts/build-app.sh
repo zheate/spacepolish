@@ -18,7 +18,7 @@ if [[ -n "$(git status --porcelain --untracked-files=normal 2>/dev/null)" ]]; th
 fi
 BUILD_TIMESTAMP="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
-swift build -c release
+swift build -c release --product Pole
 
 rm -rf "$APP_DIR"
 mkdir -p "$CONTENTS_DIR/MacOS" "$CONTENTS_DIR/Resources"

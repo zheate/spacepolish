@@ -7,6 +7,39 @@ struct TextRewritePlan: Equatable {
     let cursorUTF16: Int
     let replacementRange: NSRange
     let sourceText: String
+    let isExplicitSelection: Bool
+}
+
+enum RewriteInputPolicy {
+    static let wholeFieldCharacterLimit = 4_000
+    static let selectionCharacterLimit = 12_000
+
+    static func validate(_ plan: TextRewritePlan) throws {
+        let characterCount = plan.sourceText.count
+        if plan.isExplicitSelection {
+            guard characterCount <= selectionCharacterLimit else {
+                throw RewriteInputError.selectionTooLong
+            }
+        } else {
+            guard characterCount <= wholeFieldCharacterLimit else {
+                throw RewriteInputError.wholeFieldTooLong
+            }
+        }
+    }
+}
+
+enum RewriteInputError: LocalizedError, Equatable {
+    case wholeFieldTooLong
+    case selectionTooLong
+
+    var errorDescription: String? {
+        switch self {
+        case .wholeFieldTooLong:
+            return "文本超过 4,000 字符，请先选择需要处理的部分"
+        case .selectionTooLong:
+            return "选区超过 12,000 字符，请缩小选区"
+        }
+    }
 }
 
 enum UTF16TextRangeValidator {
@@ -46,7 +79,8 @@ enum TextRangePlanner {
             capturedText: text,
             cursorUTF16: NSMaxRange(selectedRange),
             replacementRange: replacementRange,
-            sourceText: source
+            sourceText: source,
+            isExplicitSelection: selectedRange.length > 0
         )
     }
 }
@@ -271,7 +305,7 @@ private enum TextInputSafety {
     }
 }
 
-final class CapturedTextContext {
+final class CapturedTextContext: @unchecked Sendable {
     enum Target {
         case accessibility(AXUIElement)
         case keyboard(processIdentifier: pid_t)
@@ -282,6 +316,18 @@ final class CapturedTextContext {
     let cursorUTF16: Int
     let replacementRange: NSRange
     let sourceText: String
+    let isExplicitSelection: Bool
+
+    var processIdentifier: pid_t {
+        switch target {
+        case .accessibility(let element):
+            var processIdentifier: pid_t = 0
+            _ = AXUIElementGetPid(element, &processIdentifier)
+            return processIdentifier
+        case .keyboard(let processIdentifier):
+            return processIdentifier
+        }
+    }
 
     init(target: Target, plan: TextRewritePlan) {
         self.target = target
@@ -289,6 +335,7 @@ final class CapturedTextContext {
         self.cursorUTF16 = plan.cursorUTF16
         self.replacementRange = plan.replacementRange
         self.sourceText = plan.sourceText
+        self.isExplicitSelection = plan.isExplicitSelection
     }
 }
 
@@ -989,12 +1036,13 @@ private enum KeyboardTextFallback {
     private static func copyCurrentSelection(processIdentifier: pid_t) throws -> String? {
         try ensureFrontmost(processIdentifier)
         let pasteboard = NSPasteboard.general
-        let snapshot = PasteboardSnapshot(pasteboard: pasteboard)
-        defer { snapshot.restore(to: pasteboard) }
+        let transaction = ClipboardTransaction(pasteboard: pasteboard)
+        defer { transaction.restoreIfOwned() }
 
         let marker = "Pole-selection-\(UUID().uuidString)"
-        pasteboard.clearContents()
-        pasteboard.setString(marker, forType: .string)
+        guard transaction.writeString(marker) else {
+            throw TextEditingError.keyboardTextUnavailable
+        }
         let markerChangeCount = pasteboard.changeCount
 
         try performShortcut(
@@ -1012,6 +1060,7 @@ private enum KeyboardTextFallback {
               !selection.isEmpty else {
             return nil
         }
+        _ = transaction.claimCurrentContents()
         return selection
     }
 
@@ -1169,8 +1218,8 @@ private enum KeyboardTextFallback {
     private static func readAllText(processIdentifier: pid_t) throws -> String {
         try ensureFrontmost(processIdentifier)
         let pasteboard = NSPasteboard.general
-        let snapshot = PasteboardSnapshot(pasteboard: pasteboard)
-        defer { snapshot.restore(to: pasteboard) }
+        let transaction = ClipboardTransaction(pasteboard: pasteboard)
+        defer { transaction.restoreIfOwned() }
 
         try performShortcut(
             keyCode: 0,
@@ -1181,8 +1230,9 @@ private enum KeyboardTextFallback {
         wait(0.06)
 
         let marker = "Pole-\(UUID().uuidString)"
-        pasteboard.clearContents()
-        pasteboard.setString(marker, forType: .string)
+        guard transaction.writeString(marker) else {
+            throw TextEditingError.keyboardTextUnavailable
+        }
         let markerChangeCount = pasteboard.changeCount
 
         try performShortcut(
@@ -1218,6 +1268,7 @@ private enum KeyboardTextFallback {
               text != marker else {
             throw TextEditingError.keyboardTextUnavailable
         }
+        _ = transaction.claimCurrentContents()
 
         return text
     }
@@ -1225,11 +1276,10 @@ private enum KeyboardTextFallback {
     private static func pasteAllText(_ text: String, processIdentifier: pid_t) throws {
         try ensureFrontmost(processIdentifier)
         let pasteboard = NSPasteboard.general
-        let snapshot = PasteboardSnapshot(pasteboard: pasteboard)
-        defer { snapshot.restore(to: pasteboard) }
+        let transaction = ClipboardTransaction(pasteboard: pasteboard)
+        defer { transaction.restoreIfOwned() }
 
-        pasteboard.clearContents()
-        guard pasteboard.setString(text, forType: .string) else {
+        guard transaction.writeString(text) else {
             throw TextEditingError.keyboardTextUnavailable
         }
 
@@ -1428,36 +1478,9 @@ private enum KeyboardTextFallback {
     }
 
     private static func wait(_ duration: TimeInterval) {
-        Thread.sleep(forTimeInterval: duration)
+        _ = DispatchSemaphore(value: 0).wait(timeout: .now() + duration)
     }
 
-}
-
-private struct PasteboardSnapshot {
-    private let itemContents: [[NSPasteboard.PasteboardType: Data]]
-
-    init(pasteboard: NSPasteboard) {
-        itemContents = pasteboard.pasteboardItems?.map { item in
-            Dictionary(uniqueKeysWithValues: item.types.compactMap { type in
-                guard let data = item.data(forType: type) else { return nil }
-                return (type, data)
-            })
-        } ?? []
-    }
-
-    func restore(to pasteboard: NSPasteboard) {
-        pasteboard.clearContents()
-        guard !itemContents.isEmpty else { return }
-
-        let items = itemContents.map { contents -> NSPasteboardItem in
-            let item = NSPasteboardItem()
-            for (type, data) in contents {
-                item.setData(data, forType: type)
-            }
-            return item
-        }
-        pasteboard.writeObjects(items)
-    }
 }
 
 enum TextEditingError: LocalizedError, Equatable {

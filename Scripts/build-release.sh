@@ -38,7 +38,7 @@ BUILD_TIMESTAMP="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 ARCHITECTURE="$(uname -m)"
 ZIP_PATH="$PROJECT_DIR/dist/Pole-$VERSION-$ARCHITECTURE.zip"
 
-swift build -c release
+swift build -c release --product Pole
 
 rm -rf "$APP_DIR"
 rm -f "$ZIP_PATH"

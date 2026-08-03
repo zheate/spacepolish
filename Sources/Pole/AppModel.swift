@@ -8,6 +8,7 @@ enum APIConnectionState: Equatable {
     case invalid(String)
 }
 
+@MainActor
 final class AppModel: ObservableObject {
     static let defaultPrompt = PromptPolicy.currentDefault
 
@@ -29,11 +30,18 @@ final class AppModel: ObservableObject {
     let intelligence: CommunicationIntelligenceStore
 
     private let defaults: UserDefaults
-    private let keychain: KeychainStore
+    private let credentialService: CredentialService
+    private let helperTrustStore: HelperTrustStore
+    private var pendingHistoryAnalysisPreference: Bool
 
-    init(defaults: UserDefaults = .standard, keychain: KeychainStore = KeychainStore()) {
+    init(
+        defaults: UserDefaults = .standard,
+        credentialService: CredentialService = CredentialService()
+    ) {
         self.defaults = defaults
-        self.keychain = keychain
+        self.credentialService = credentialService
+        let helperTrustStore = HelperTrustStore(defaults: defaults)
+        self.helperTrustStore = helperTrustStore
         let legacyProfiles = ConversationProfileStore(defaults: defaults)
         self.conversationProfiles = legacyProfiles
         self.intelligence = CommunicationIntelligenceStore(
@@ -41,7 +49,7 @@ final class AppModel: ObservableObject {
             legacyProfiles: legacyProfiles.profiles
         )
         self.isEnabled = defaults.object(forKey: "isEnabled") as? Bool ?? true
-        self.apiKey = (try? keychain.read()) ?? ""
+        self.apiKey = (try? credentialService.readAPIKey()) ?? ""
         let savedModel = defaults.string(forKey: "modelName")
         self.modelName = ["qwen3.7-plus", "qwen3.6-flash"].contains(savedModel)
             ? savedModel!
@@ -53,11 +61,20 @@ final class AppModel: ObservableObject {
         self.soundEffectsEnabled = defaults.object(forKey: "soundEffectsEnabled") as? Bool ?? true
         self.enabledSemanticLibraries = SemanticLibraryPreferences.load(from: defaults)
         let helperURL = Self.resolveHelperURL(from: defaults)
+        let savedHistoryAnalysisPreference = defaults.bool(forKey: "historyAnalysisEnabled")
+        self.pendingHistoryAnalysisPreference = savedHistoryAnalysisPreference
         self.historyAnalysisEnabled = helperURL != nil
-            && defaults.bool(forKey: "historyAnalysisEnabled")
+            && helperTrustStore.approvedIdentity != nil
+            && savedHistoryAnalysisPreference
         self.rewriteLearningEnabled = defaults.bool(forKey: "rewriteLearningEnabled")
         self.helperPath = helperURL?.path ?? ""
-        self.helperStatusText = helperPath.isEmpty ? "未配置" : "待检测"
+        if helperPath.isEmpty {
+            self.helperStatusText = "未配置"
+        } else if let identity = helperTrustStore.approvedIdentity {
+            self.helperStatusText = identity.displaySummary
+        } else {
+            self.helperStatusText = "需要重新确认 helper 身份"
+        }
     }
 
     var hasAPIKey: Bool {
@@ -93,9 +110,9 @@ final class AppModel: ObservableObject {
     func save() throws {
         let cleanKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         if cleanKey.isEmpty {
-            try keychain.delete()
+            try credentialService.deleteAPIKey()
         } else {
-            try keychain.save(cleanKey)
+            try credentialService.saveAPIKey(cleanKey)
         }
 
         prompt = PromptPolicy.resolvedPrompt(from: prompt)
@@ -107,8 +124,14 @@ final class AppModel: ObservableObject {
         SemanticLibraryPreferences.save(enabledSemanticLibraries, to: defaults)
         if helperURL == nil {
             historyAnalysisEnabled = false
+            pendingHistoryAnalysisPreference = false
+            defaults.set(false, forKey: "historyAnalysisEnabled")
+        } else if helperNeedsConfirmation {
+            defaults.set(pendingHistoryAnalysisPreference, forKey: "historyAnalysisEnabled")
+        } else {
+            pendingHistoryAnalysisPreference = historyAnalysisEnabled
+            defaults.set(historyAnalysisEnabled, forKey: "historyAnalysisEnabled")
         }
-        defaults.set(historyAnalysisEnabled, forKey: "historyAnalysisEnabled")
         defaults.set(rewriteLearningEnabled, forKey: "rewriteLearningEnabled")
         defaults.removeObject(forKey: "conversationHelperPath")
     }
@@ -117,7 +140,15 @@ final class AppModel: ObservableObject {
         Self.resolveHelperURL(from: defaults)
     }
 
-    func setHelperURL(_ url: URL?) {
+    var approvedHelperIdentity: HelperIdentity? {
+        helperTrustStore.approvedIdentity
+    }
+
+    var helperNeedsConfirmation: Bool {
+        helperURL != nil && approvedHelperIdentity == nil
+    }
+
+    func setHelperURL(_ url: URL?, approvedIdentity: HelperIdentity? = nil) {
         guard let url else {
             helperPath = ""
             helperStatusText = "未配置"
@@ -125,6 +156,8 @@ final class AppModel: ObservableObject {
             defaults.set(false, forKey: "historyAnalysisEnabled")
             defaults.removeObject(forKey: "conversationHelperBookmark")
             defaults.removeObject(forKey: "conversationHelperPath")
+            helperTrustStore.clear()
+            pendingHistoryAnalysisPreference = false
             return
         }
         guard let bookmark = try? url.bookmarkData(
@@ -139,7 +172,15 @@ final class AppModel: ObservableObject {
         defaults.set(bookmark, forKey: "conversationHelperBookmark")
         defaults.removeObject(forKey: "conversationHelperPath")
         helperPath = url.path
-        helperStatusText = "待检测"
+        if let approvedIdentity {
+            helperTrustStore.approve(approvedIdentity)
+            helperStatusText = approvedIdentity.displaySummary
+            historyAnalysisEnabled = pendingHistoryAnalysisPreference
+        } else {
+            helperTrustStore.clear()
+            historyAnalysisEnabled = false
+            helperStatusText = "需要确认 helper 身份"
+        }
     }
 
     private static func resolveHelperURL(from defaults: UserDefaults) -> URL? {

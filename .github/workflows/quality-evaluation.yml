@@ -1,0 +1,16 @@
+name: Online quality evaluation
+
+on:
+  workflow_dispatch:
+
+jobs:
+  evaluate:
+    runs-on: macos-14
+    env:
+      POLE_API_KEY: ${{ secrets.POLE_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Evaluate polish quality
+        run: swift run -c release PoleQualityEvaluation 40
+      - name: Evaluate expansion quality
+        run: swift run -c release PoleQualityEvaluation --expand 22

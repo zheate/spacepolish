@@ -178,7 +178,7 @@ struct ConversationSnapshot: Equatable {
     }
 }
 
-enum ConversationRole: String, CaseIterable, Codable, Equatable {
+package enum ConversationRole: String, CaseIterable, Codable, Equatable {
     case manager
     case customer
     case colleague
@@ -520,7 +520,7 @@ enum ConversationResolutionMode: Equatable {
     }
 }
 
-final class ConversationResolver {
+final class ConversationResolver: @unchecked Sendable {
     private static let textRecognitionQueue = DispatchQueue(
         label: "com.spacepolish.conversation-ocr",
         qos: .userInitiated
@@ -596,9 +596,10 @@ final class ConversationResolver {
             )
         }
 
-        let ocrCandidate = window.identifier.flatMap {
-            ocrCandidate(
-                windowIdentifier: $0,
+        let ocrCandidate: ConversationTitleCandidate? = window.identifier.flatMap {
+            windowIdentifier in
+            self.ocrCandidate(
+                windowIdentifier: windowIdentifier,
                 applicationName: application.localizedName
             )
         }
@@ -614,6 +615,14 @@ final class ConversationResolver {
             candidate: candidate,
             applicationContext: applicationContext
         )
+    }
+
+    func resolveCurrentConversationAsync() async -> ConversationSnapshot? {
+        await withCheckedContinuation { continuation in
+            Self.textRecognitionQueue.async {
+                continuation.resume(returning: self.resolveCurrentConversation())
+            }
+        }
     }
 
     func matchesCurrentConversation(_ snapshot: ConversationSnapshot) -> Bool {
@@ -729,9 +738,7 @@ final class ConversationResolver {
         let cropRect = CGRect(x: 0, y: 0, width: image.width, height: headerHeight)
         guard let headerImage = image.cropping(to: cropRect) else { return nil }
 
-        let observations = Self.textRecognitionQueue.sync {
-            Self.performTextRecognition(on: headerImage)
-        }
+        let observations = Self.performTextRecognition(on: headerImage)
         let candidates = observations.compactMap { observation -> ConversationTitleCandidate? in
             guard let recognizedText = observation.topCandidates(1).first,
                   ConversationTitleNormalizer.isUsable(recognizedText.string, applicationName: applicationName) else {

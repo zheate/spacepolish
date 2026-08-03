@@ -1,5 +1,6 @@
 import AppKit
 
+@MainActor
 final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private let model: AppModel
     private let onValidateAPIKey: (String) async throws -> Void
@@ -250,7 +251,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         let removeButton = NSButton(title: "移除", target: self, action: #selector(removeHelper))
         let helperButtons = horizontalStack([chooseButton, testButton, removeButton, flexibleSpacer()], spacing: 8)
         let helperHint = secondaryLabel(
-            "Pole 只调用用户提供的只读 JSON helper，不安装组件、不提取密钥，也不修改微信。协议包含 capabilities、sessions 和 history。"
+            "helper 是用户信任的本地可执行程序，会以当前账户权限运行。Pole 会核对文件身份和只读声明，但无法限制它访问或修改你有权限的数据。"
         )
         let helperBox = makeBox(
             title: "外部聊天历史 helper",
@@ -523,17 +524,53 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
     @objc private func chooseHelper() {
         let panel = NSOpenPanel()
-        panel.title = "选择只读聊天历史 helper"
+        panel.title = "选择聊天历史 helper"
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        model.setHelperURL(url)
-        helperPathLabel.stringValue = model.helperPath.isEmpty ? "未配置本地 helper" : model.helperPath
-        helperStatusLabel.stringValue = model.helperPath.isEmpty
-            ? model.helperStatusText
-            : "待检测；Pole 不会执行安装或提权"
-        syncHelperDependentControls()
+        helperPathLabel.stringValue = url.path
+        helperStatusLabel.stringValue = "正在检查文件身份…"
+        Task { [weak self] in
+            do {
+                let scopedAccess = url.startAccessingSecurityScopedResource()
+                defer { if scopedAccess { url.stopAccessingSecurityScopedResource() } }
+                let identity = try await HelperIdentityService().inspect(url)
+                await MainActor.run {
+                    guard let self,
+                          self.confirmHelperTrust(url: url, identity: identity) else {
+                        self?.loadModelIntoControls()
+                        return
+                    }
+                    self.model.setHelperURL(url, approvedIdentity: identity)
+                    self.helperPathLabel.stringValue = url.path
+                    self.helperStatusLabel.stringValue = identity.displaySummary
+                    self.syncHelperDependentControls()
+                }
+            } catch {
+                await MainActor.run {
+                    self?.helperStatusLabel.stringValue = error.localizedDescription
+                    self?.syncHelperDependentControls()
+                }
+            }
+        }
+    }
+
+    private func confirmHelperTrust(url: URL, identity: HelperIdentity) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "信任这个本地 helper？"
+        alert.informativeText = """
+        \(url.path)
+
+        \(identity.signature.displayText)
+        SHA-256：\(identity.sha256)
+
+        该程序将以你的账户权限运行。readOnly 只是 helper 自行声明，Pole 无法阻止它访问或修改你有权限的数据。仅在你信任其来源时继续。
+        """
+        alert.addButton(withTitle: "信任并使用")
+        alert.addButton(withTitle: "取消")
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     @objc private func removeHelper() {
@@ -549,10 +586,17 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             helperStatusLabel.stringValue = "请先选择 helper"
             return
         }
+        guard let approvedIdentity = model.approvedHelperIdentity else {
+            helperStatusLabel.stringValue = "需要重新确认 helper 身份"
+            return
+        }
         helperStatusLabel.stringValue = "正在检测…"
         Task { [weak self] in
             do {
-                let capabilities = try await ExternalHelperProvider(executableURL: url).capabilities()
+                let capabilities = try await ExternalHelperProvider(
+                    executableURL: url,
+                    approvedIdentity: approvedIdentity
+                ).capabilities()
                 await MainActor.run {
                     self?.model.helperStatusText = "已连接 · \(capabilities.provider) · 协议 v\(capabilities.protocolVersion)"
                     self?.helperStatusLabel.stringValue = self?.model.helperStatusText ?? "已连接"
@@ -675,6 +719,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             }
         )
         model.historyAnalysisEnabled = model.helperURL != nil
+            && model.approvedHelperIdentity != nil
             && historyCheckbox.state == .on
         model.rewriteLearningEnabled = learningCheckbox.state == .on
     }
@@ -708,9 +753,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     }
 
     private func syncHelperDependentControls() {
-        let hasHelper = model.helperURL != nil
-        historyCheckbox.isEnabled = hasHelper
-        if !hasHelper {
+        let hasTrustedHelper = model.helperURL != nil
+            && model.approvedHelperIdentity != nil
+        historyCheckbox.isEnabled = hasTrustedHelper
+        if !hasTrustedHelper {
             historyCheckbox.state = .off
         }
     }
