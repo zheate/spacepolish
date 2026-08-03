@@ -99,7 +99,10 @@ enum FactGuard {
         #"\d{4}[./-]\d{1,2}[./-]\d{1,2}"#,
         #"[\p{Han}]{1,4}(?:总|老师|经理|主任|博士)"#
     ]
-    private static let negativeMarkers = ["不", "没", "未", "不能", "无法", "不要", "并非", "否认"]
+    private static let negativeMarkers = [
+        "不", "没", "未", "不能", "无法", "不要", "并非", "否认",
+        "隐藏", "隐去", "不显示", "不展示", "不出现", "不可见"
+    ]
     private static let uncertainMarkers = ["可能", "也许", "大概", "预计", "应该", "似乎", "风险", "暂时"]
     private static let certainMarkers = ["已经", "确定", "一定", "必然", "确认", "肯定", "完成了"]
     private static let sequenceMarkers = [
@@ -267,7 +270,8 @@ enum FactGuard {
 
     private static func containsResponsibilityAssignment(in text: String) -> Bool {
         let patterns = [
-            #"(?:由|让|交给)[\p{Han}A-Za-z0-9_·]{1,12}(?:负责|处理|跟进|完成)"#,
+            #"(?:由|交给)[\p{Han}A-Za-z0-9_·]{1,12}(?:负责|处理|跟进|完成)"#,
+            #"让(?:我|我们|你|你们|他|她|他们|[\p{Han}]{1,3}(?:总|工|经理|老师|团队|部门|组|开发|前端|后端|系统|程序)|[\p{Han}]{1,3})(?:来)?(?:负责|处理|跟进|完成)"#,
             #"(?:我|我们|他|她|他们)来(?:负责|处理|跟进|完成)"#
         ]
         return patterns.contains { pattern in
@@ -348,7 +352,7 @@ enum MessagingRewriteRetryPolicy {
     ]
 
     private static let explicitIssueMarkers = [
-        "怎么优化", "帮我润色", "优化一下", "润色一下", "修改一下",
+        "怎么优化", "帮我润色", "优化一下", "润色一下", "修改一下", "改一下", "改下",
         "的的", "进行一个", "来进行", "然后的话", "目的主要是为了",
         "目前来说", "这边的话", "相关的一个", "通讯", "相对来说比较"
     ]
@@ -360,7 +364,6 @@ enum MessagingRewriteRetryPolicy {
         let source = normalized(sourceText)
         let output = normalized(candidate)
         guard source == output,
-              source.count >= 6,
               !isNaturallyCompleteShortMessage(source) else {
             return false
         }
@@ -394,10 +397,8 @@ enum MessagingRewriteRetryPolicy {
             reasons.append("标点存在重复或混用")
         }
         let clauseSeparators = source.filter { "，,；;：:".contains($0) }.count
-        if source.count >= 14, clauseSeparators >= 2 {
+        if clauseSeparators >= 2 {
             reasons.append("多个分句需要检查衔接和节奏")
-        } else if source.count >= 28 {
-            reasons.append("较长表达需要检查语序和冗余")
         }
         if occurrences(of: "帮我", in: source) >= 2
             || occurrences(of: "然后", in: source) >= 2
@@ -538,7 +539,7 @@ struct AdaptivePolishPlan: Equatable, Sendable {
 enum AdaptivePolishPolicy {
     static func plan(
         for sourceText: String,
-        applicationRole: ApplicationWritingRole
+        applicationRole _: ApplicationWritingRole
     ) -> AdaptivePolishPlan {
         let source = sourceText.precomposedStringWithCanonicalMapping
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -549,23 +550,11 @@ enum AdaptivePolishPolicy {
             )
         }
 
-        let paragraphCount = source
-            .components(separatedBy: .newlines)
-            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            .count
-        let separatorCount = source.filter {
-            "，,；;：:。！？!?".contains($0)
-        }.count
         let issueReasons = MessagingRewriteRetryPolicy.improvementReasons(in: source)
 
-        if shouldUseStrongPolish(
-            source: source,
-            paragraphCount: paragraphCount,
-            separatorCount: separatorCount,
-            applicationRole: applicationRole
-        ) {
+        if shouldUseStrongPolish(source: source) {
             var reasons = issueReasons
-            reasons.append("文本较长或包含多个层级，需要结构整理")
+            reasons.append("存在明确并列层级，需要结构整理")
             return AdaptivePolishPlan(
                 intensity: .strong,
                 reasons: unique(reasons)
@@ -578,34 +567,13 @@ enum AdaptivePolishPolicy {
                 reasons: ["自然完整的短回复"]
             )
         }
-        if source.count <= 6,
-           issueReasons.isEmpty,
-           paragraphCount <= 1,
-           separatorCount == 0 {
-            return AdaptivePolishPlan(
-                intensity: .none,
-                reasons: ["极短文本未发现明确问题"]
-            )
-        }
-
         if !issueReasons.isEmpty {
-            let intensity: AdaptivePolishIntensity = source.count <= 18
-                && paragraphCount <= 1
-                && separatorCount <= 1
-                ? .light
-                : .standard
+            let intensity: AdaptivePolishIntensity = issueReasons.contains {
+                $0 == "多个分句需要检查衔接和节奏"
+            } ? .standard : .light
             return AdaptivePolishPlan(
                 intensity: intensity,
                 reasons: unique(issueReasons)
-            )
-        }
-
-        if source.count <= 18,
-           paragraphCount <= 1,
-           separatorCount == 0 {
-            return AdaptivePolishPlan(
-                intensity: .light,
-                reasons: ["短文本只需要局部检查"]
             )
         }
 
@@ -615,25 +583,8 @@ enum AdaptivePolishPolicy {
         )
     }
 
-    private static func shouldUseStrongPolish(
-        source: String,
-        paragraphCount: Int,
-        separatorCount: Int,
-        applicationRole: ApplicationWritingRole
-    ) -> Bool {
-        if ParallelListPolicy.shouldPreferNumberedList(source) { return true }
-        if paragraphCount >= 3 || source.count >= 96 { return true }
-        if source.count >= 64, separatorCount >= 5 { return true }
-        switch applicationRole {
-        case .messaging, .document, .email, .generic:
-            if source.count >= 48, separatorCount <= 1 { return true }
-            if applicationRole == .document || applicationRole == .email {
-                return source.count >= 64 && paragraphCount >= 2
-            }
-            return false
-        default:
-            return false
-        }
+    private static func shouldUseStrongPolish(source: String) -> Bool {
+        ParallelListPolicy.shouldPreferNumberedList(source)
     }
 
     private static func unique(_ reasons: [String]) -> [String] {

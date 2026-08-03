@@ -114,7 +114,7 @@ enum ParallelListPolicy {
     static func shouldPreferNumberedList(_ text: String) -> Bool {
         let normalized = text.precomposedStringWithCanonicalMapping
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard normalized.count >= 10 else { return false }
+        guard !normalized.isEmpty else { return false }
         if containsNumberedList(normalized) { return true }
 
         let hasExplicitCount = containsPattern(
@@ -265,7 +265,7 @@ enum PromptPolicy {
     原文：王工，BOM里面局部镀的规格现在还没确认，这个你先帮我确认一下然后我这边再算成本。
     成稿：王工，BOM 里局部镀的规格还没确认，麻烦你先核一下，确认后我再算成本。
 
-    有明确改进空间时必须给出真正改善后的版本。默认给出经过优化的版本：当原文是一句以上、或超过 12 个字、或存在任何可改善之处时，必须至少完成一处能够提升清晰度、准确性或自然度的有效修改；不要为了制造差异而做无收益的同义替换，也不得改变事实或语气。只有逐项检查后确认原文已经自然、准确、清楚且可直接使用，才原样返回。
+    有明确改进空间时必须给出真正改善后的版本；不要为了制造差异而做无收益的同义替换，也不得改变事实或语气。只有逐项检查后确认原文已经自然、准确、清楚且可直接使用，才原样返回。
     结果只能包含成稿，不要加标题、解释、引号、修改说明或 Markdown。
     """
 
@@ -283,7 +283,8 @@ enum PromptPolicy {
         ].map {
             $0.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        if defaultsToUpgrade.contains(normalized) {
+        if defaultsToUpgrade.contains(normalized)
+            || normalized.contains("当原文是一句以上、或超过 12 个字、或存在任何可改善之处时") {
             return currentDefault
         }
         return storedPrompt

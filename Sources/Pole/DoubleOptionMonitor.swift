@@ -50,12 +50,22 @@ final class DoubleOptionMonitor {
     var isEnabled: () -> Bool = { true }
     var maximumInterval: () -> Double = { 1.2 }
     var onTrigger: (OptionKeySide) -> Void = { _ in }
+    var onExpand: () -> Void = {}
 
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var sequenceTracker = DoubleOptionSequenceTracker()
     private var pressedOptionKeyCodes: Set<Int64> = []
     private var optionChordUsed = false
+    private var expandChordPending = false
+
+    static func beginsExpandChord(
+        pressedOptionKeyCodes: Set<Int64>,
+        optionChordUsed: Bool,
+        hasBlockedModifiers: Bool
+    ) -> Bool {
+        !pressedOptionKeyCodes.isEmpty && !optionChordUsed && !hasBlockedModifiers
+    }
 
     func start() throws {
         guard eventTap == nil else { return }
@@ -139,8 +149,15 @@ final class DoubleOptionMonitor {
             guard pressedOptionKeyCodes.isEmpty else { return }
 
             if optionChordUsed {
+                let shouldExpand = expandChordPending
                 optionChordUsed = false
+                expandChordPending = false
                 sequenceTracker.reset()
+                if shouldExpand {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.onExpand()
+                    }
+                }
                 return
             }
 
@@ -163,8 +180,15 @@ final class DoubleOptionMonitor {
             .maskShift,
             .maskSecondaryFn
         ]
-        if !event.flags.intersection(blockedModifiers).isEmpty
-            || !pressedOptionKeyCodes.isEmpty {
+        let hasBlockedModifiers = !event.flags.intersection(blockedModifiers).isEmpty
+        if Self.beginsExpandChord(
+            pressedOptionKeyCodes: pressedOptionKeyCodes,
+            optionChordUsed: optionChordUsed,
+            hasBlockedModifiers: hasBlockedModifiers
+        ) {
+            expandChordPending = true
+        }
+        if hasBlockedModifiers || !pressedOptionKeyCodes.isEmpty {
             optionChordUsed = true
             sequenceTracker.reset()
         }
@@ -175,6 +199,7 @@ final class DoubleOptionMonitor {
         sequenceTracker.reset()
         pressedOptionKeyCodes.removeAll()
         optionChordUsed = false
+        expandChordPending = false
     }
 
     deinit {

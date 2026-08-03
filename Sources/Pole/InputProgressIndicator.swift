@@ -29,49 +29,16 @@ enum InputProgressSoundCue: Equatable {
     }
 }
 
-enum InputProgressMoveStyle: Equatable {
-    case immediate
-    case eased
-    case crossfade
-}
-
-enum InputProgressMotionPolicy {
-    private static let maximumEasedDistance: CGFloat = 40
-    private static let maximumEasedVerticalDelta: CGFloat = 6
-
-    static func style(
-        from current: CGPoint,
-        to target: CGPoint,
-        reducesMotion: Bool
-    ) -> InputProgressMoveStyle {
-        guard !reducesMotion else { return .immediate }
-
-        let deltaX = target.x - current.x
-        let deltaY = target.y - current.y
-        let distance = sqrt(deltaX * deltaX + deltaY * deltaY)
-        guard distance > 0.5 else { return .immediate }
-
-        if distance <= maximumEasedDistance,
-           abs(deltaY) <= maximumEasedVerticalDelta {
-            return .eased
-        }
-        return .crossfade
-    }
-}
-
 private enum IndicatorTiming {
     static let entrance: TimeInterval = 0.16
-    static let easedMove: TimeInterval = 0.14
-    static let crossfadeOut: TimeInterval = 0.07
-    static let crossfadeIn: TimeInterval = 0.11
     static let resultTransition: TimeInterval = 0.32
-    static let checkedAnimation: TimeInterval = 2.0
+    static let checkedAnimation: TimeInterval = 2.2
     static let alertAnimation: TimeInterval = 80 / 29.9700012207031
     static let dismissal: TimeInterval = 0.14
 }
 
 final class InputProgressIndicator {
-    private static let caretHorizontalGap: CGFloat = 6
+    private static let caretHorizontalGap: CGFloat = 8
     private static let indicatorSize = NSSize(width: 38, height: 30)
 
     private let indicator: ProgressIndicatorView
@@ -79,8 +46,8 @@ final class InputProgressIndicator {
     private let soundPlayer = InputProgressSoundPlayer()
     private let isSoundEnabled: () -> Bool
     private var dismissalWorkItem: DispatchWorkItem?
+    private var resultCompletion: (() -> Void)?
     private var presentationGeneration = 0
-    private var movementGeneration = 0
     private var reducesMotion = false
 
     init(isSoundEnabled: @escaping () -> Bool = { true }) {
@@ -115,9 +82,9 @@ final class InputProgressIndicator {
         operation: InputProgressOperation = .optimization
     ) -> Bool {
         presentationGeneration &+= 1
-        movementGeneration &+= 1
         dismissalWorkItem?.cancel()
         dismissalWorkItem = nil
+        completeResultPresentation()
 
         reducesMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         guard let initialOrigin = panelOrigin(
@@ -134,9 +101,9 @@ final class InputProgressIndicator {
         operation: InputProgressOperation = .optimization
     ) {
         presentationGeneration &+= 1
-        movementGeneration &+= 1
         dismissalWorkItem?.cancel()
         dismissalWorkItem = nil
+        completeResultPresentation()
 
         let mouseLocation = NSEvent.mouseLocation
         let origin = NSPoint(
@@ -167,82 +134,10 @@ final class InputProgressIndicator {
         )
     }
 
-    func move(
-        to accessibilityScreenRect: CGRect?,
-        completion: @escaping () -> Void = {}
-    ) {
-        guard panel.isVisible,
-              let accessibilityScreenRect,
-              let origin = panelOrigin(
-                for: accessibilityScreenRect,
-                indicatorSize: panel.frame.size
-              ) else {
-            completion()
-            return
-        }
-
-        let target = clampedOrigin(origin, indicatorSize: panel.frame.size)
-        let style = InputProgressMotionPolicy.style(
-            from: panel.frame.origin,
-            to: target,
-            reducesMotion: reducesMotion
-        )
-
-        movementGeneration &+= 1
-        let generation = movementGeneration
-        switch style {
-        case .immediate:
-            panel.setFrameOrigin(target)
-            completion()
-        case .eased:
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = IndicatorTiming.easedMove
-                context.timingFunction = CAMediaTimingFunction(
-                    controlPoints: 0.22,
-                    0.78,
-                    0.24,
-                    1
-                )
-                panel.animator().setFrameOrigin(target)
-            } completionHandler: { [weak self] in
-                guard let self,
-                      self.movementGeneration == generation,
-                      self.panel.isVisible else {
-                    return
-                }
-                completion()
-            }
-        case .crossfade:
-            animatePanelAlpha(
-                to: 0.28,
-                duration: IndicatorTiming.crossfadeOut,
-                timingFunction: .easeIn
-            ) { [weak self] in
-                guard let self,
-                      self.movementGeneration == generation,
-                      self.panel.isVisible else {
-                    return
-                }
-                self.panel.setFrameOrigin(target)
-                self.animatePanelAlpha(
-                    to: 1,
-                    duration: IndicatorTiming.crossfadeIn,
-                    timingFunction: .easeOut
-                ) { [weak self] in
-                    guard let self,
-                          self.movementGeneration == generation,
-                          self.panel.isVisible else {
-                        return
-                    }
-                    completion()
-                }
-            }
-        }
-    }
-
     func finish(
         with outcome: OptimizationOutcome,
-        operation: InputProgressOperation = .optimization
+        operation: InputProgressOperation = .optimization,
+        completion: @escaping () -> Void = {}
     ) {
         let state: IndicatorVisualState
         switch outcome {
@@ -265,7 +160,8 @@ final class InputProgressIndicator {
         showResult(
             state,
             accessibilityDescription: accessibilityDescription,
-            soundCue: .result(for: outcome, operation: operation)
+            soundCue: .result(for: outcome, operation: operation),
+            completion: completion
         )
     }
 
@@ -280,14 +176,19 @@ final class InputProgressIndicator {
     private func showResult(
         _ state: IndicatorVisualState,
         accessibilityDescription: String,
-        soundCue: InputProgressSoundCue
+        soundCue: InputProgressSoundCue,
+        completion: @escaping () -> Void = {}
     ) {
+        dismissalWorkItem?.cancel()
+        dismissalWorkItem = nil
+        completeResultPresentation()
+        resultCompletion = completion
+
         guard panel.isVisible else {
             hide()
             return
         }
 
-        dismissalWorkItem?.cancel()
         if isSoundEnabled() {
             soundPlayer.play(soundCue)
         }
@@ -313,11 +214,11 @@ final class InputProgressIndicator {
         dismissalWorkItem = nil
         guard presentationGeneration == generation, panel.isVisible else { return }
 
-        movementGeneration &+= 1
         if reducesMotion {
             indicator.stopAnimating()
             panel.orderOut(nil)
             panel.alphaValue = 1
+            completeResultPresentation()
             return
         }
 
@@ -330,7 +231,14 @@ final class InputProgressIndicator {
             self.indicator.stopAnimating()
             self.panel.orderOut(nil)
             self.panel.alphaValue = 1
+            self.completeResultPresentation()
         }
+    }
+
+    private func completeResultPresentation() {
+        let completion = resultCompletion
+        resultCompletion = nil
+        completion?()
     }
 
     private func animatePanelAlpha(
@@ -380,16 +288,17 @@ final class InputProgressIndicator {
 
     func hide() {
         presentationGeneration &+= 1
-        movementGeneration &+= 1
         dismissalWorkItem?.cancel()
         dismissalWorkItem = nil
         indicator.stopAnimating()
         panel.orderOut(nil)
         panel.alphaValue = 1
+        completeResultPresentation()
     }
 
     deinit {
         dismissalWorkItem?.cancel()
+        completeResultPresentation()
         indicator.stopAnimating()
         panel.orderOut(nil)
     }

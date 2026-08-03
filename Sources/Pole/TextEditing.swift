@@ -232,7 +232,8 @@ enum KeyboardFallbackPolicy {
 
     private static let customEditorBundleIdentifiers: Set<String> = [
         "com.tencent.xinwechat",
-        "com.tencent.weworkmac"
+        "com.tencent.weworkmac",
+        "com.openai.codex"
     ]
 
     static func allows(bundleIdentifier: String) -> Bool {

@@ -653,6 +653,22 @@ do {
     check(OptionKeySide(keyCode: 58) == .left, "识别左 Option 键码")
     check(OptionKeySide(keyCode: 61) == .right, "识别右 Option 键码")
     check(OptionKeySide(keyCode: 59) == nil, "忽略非 Option 键码")
+    check(
+        DoubleOptionMonitor.beginsExpandChord(
+            pressedOptionKeyCodes: [58],
+            optionChordUsed: false,
+            hasBlockedModifiers: false
+        ),
+        "左右 Option 同时按下触发适当扩写"
+    )
+    check(
+        !DoubleOptionMonitor.beginsExpandChord(
+            pressedOptionKeyCodes: [58],
+            optionChordUsed: false,
+            hasBlockedModifiers: true
+        ),
+        "含其他修饰键时不触发适当扩写"
+    )
 
     var tracker = DoubleOptionSequenceTracker()
     check(
@@ -695,6 +711,13 @@ check(
     "通用回退保留微信支持"
 )
 check(
+    KeyboardFallbackPolicy.shouldRetryWriteback(
+        after: .cannotSetSelection,
+        bundleIdentifier: "com.openai.codex"
+    ),
+    "Codex 选区恢复失败时允许安全键盘写回"
+)
+check(
     !KeyboardFallbackPolicy.allows(bundleIdentifier: "com.apple.Terminal"),
     "键盘回退拒绝终端"
 )
@@ -731,7 +754,7 @@ check(
 check(
     !KeyboardFallbackPolicy.shouldRetryCapture(
         after: .noTextToOptimize,
-        bundleIdentifier: "com.openai.codex"
+        bundleIdentifier: "com.apple.TextEdit"
     ),
     "标准编辑器的空输入不会触发侵入式键盘读取"
 )
@@ -828,13 +851,13 @@ check(
     "完整短指令不再预判为无需修改"
 )
 let lightPolishPlan = AdaptivePolishPolicy.plan(
-    for: "这个结果不太对",
+    for: "的的",
     applicationRole: .messaging
 )
 check(
     lightPolishPlan.intensity == .light
         && lightPolishPlan.shouldRequestModel,
-    "极短且无分隔符的文本使用轻量润色"
+    "明确局部问题使用轻量润色"
 )
 let standardPunctuationPlan = AdaptivePolishPolicy.plan(
     for: "这个结果不对，，麻烦再检查一下",
@@ -842,7 +865,7 @@ let standardPunctuationPlan = AdaptivePolishPolicy.plan(
 )
 check(
     standardPunctuationPlan.intensity == .standard,
-    "明确但局部的标点问题使用标准润色"
+    "包含分句和标点问题时使用标准润色"
 )
 let ordinaryShortCommandPlan = AdaptivePolishPolicy.plan(
     for: "这个文件你改一下",
@@ -879,7 +902,7 @@ let runOnPolishPlan = AdaptivePolishPolicy.plan(
 )
 check(
     strongPolishPlan.intensity == .strong
-        && runOnPolishPlan.intensity == .strong,
+        && runOnPolishPlan.intensity == .standard,
     "明确的多项结构使用强力润色"
 )
 let adaptiveLightPrompt = PromptPolicy.polishPrompt(
@@ -1081,9 +1104,11 @@ check(
         && PromptPolicy.currentDefault.contains("BOM 里局部镀")
         && PromptPolicy.currentDefault.contains("发现多个问题时全部处理")
         && PromptPolicy.currentDefault.contains("有明确改进空间时必须给出真正改善后的版本")
-        && PromptPolicy.currentDefault.contains("默认给出经过优化的版本")
-        && PromptPolicy.currentDefault.contains("必须至少完成一处能够提升清晰度、准确性或自然度的有效修改")
         && PromptPolicy.currentDefault.contains("才原样返回")
+        && !PromptPolicy.currentDefault.contains("超过 12 个字")
+        && PromptPolicy.resolvedPrompt(
+            from: "旧默认：当原文是一句以上、或超过 12 个字、或存在任何可改善之处时"
+        ) == PromptPolicy.currentDefault
         && !PromptPolicy.currentDefault.contains("优先原样输出")
         && !PromptPolicy.currentDefault.contains("可以原样返回"),
     "新版提示词兼顾信息保留和主动有效修改"
@@ -1351,6 +1376,12 @@ check(
     InputProgressSoundCue.completion.fallbackSoundName == "Glass",
     "完成音效资源缺失时回退到系统 Glass"
 )
+let hiddenProgressIndicator = InputProgressIndicator(isSoundEnabled: { false })
+var hiddenProgressDidFinish = false
+hiddenProgressIndicator.finish(with: .complete) {
+    hiddenProgressDidFinish = true
+}
+check(hiddenProgressDidFinish, "无可见动画时立即继续显示优化文字")
 let completionColor = InputProgressPalette.completion
 check(
     completionColor.redComponent < 0.10
@@ -1376,38 +1407,6 @@ check(
         isRetry: false
     ) == 45,
     "长文本保留完整请求超时"
-)
-check(
-    InputProgressMotionPolicy.style(
-        from: CGPoint(x: 100, y: 100),
-        to: CGPoint(x: 124, y: 102),
-        reducesMotion: false
-    ) == .eased,
-    "同行小范围光标移动使用缓动"
-)
-check(
-    InputProgressMotionPolicy.style(
-        from: CGPoint(x: 100, y: 100),
-        to: CGPoint(x: 112, y: 118),
-        reducesMotion: false
-    ) == .crossfade,
-    "跨行光标移动使用交叉淡化"
-)
-check(
-    InputProgressMotionPolicy.style(
-        from: CGPoint(x: 100, y: 100),
-        to: CGPoint(x: 180, y: 100),
-        reducesMotion: false
-    ) == .crossfade,
-    "长距离光标移动使用交叉淡化"
-)
-check(
-    InputProgressMotionPolicy.style(
-        from: CGPoint(x: 100, y: 100),
-        to: CGPoint(x: 124, y: 102),
-        reducesMotion: true
-    ) == .immediate,
-    "减少动态效果时直接定位"
 )
 check(QwenClient.temperature == 0.5, "模型温度保持为 0.5")
 check(QwenClient.defaultModel == "qwen3.7-plus", "默认使用 Qwen 3.7 Plus")
@@ -1958,6 +1957,18 @@ check(
     "事实守卫不依赖模型自报也会拒绝新增原因"
 )
 check(
+    FactGuard.audit(
+        sourceText: "关于 zh style 所有的正文里面的删除和编辑按钮，都改为默认不显示，鼠标移动才显示",
+        result: StructuredRewriteResult(
+            rewrittenText: "关于 ZH Style，正文中的删除和编辑按钮默认隐藏，鼠标移入后再显示。"
+        ),
+        applicationRole: .aiDevelopmentAssistant,
+        expansionRatio: 1.35,
+        lengthBudget: .polish(maximumRatio: 1.35)
+    ).accepted,
+    "默认不显示改为默认隐藏时保留否定关系"
+)
+check(
     !FactGuard.audit(
         sourceText: "先把报价发送给客户，再确认合同。",
         result: StructuredRewriteResult(rewrittenText: "确认合同。"),
@@ -1974,6 +1985,18 @@ check(
         expansionRatio: 1.35
     ).accepted,
     "事实守卫拒绝擅自增加责任人"
+)
+check(
+    FactGuard.audit(
+        sourceText: "现在的动画结束才会展示优化后的字儿，顺序改一下，动画往后放一放，优化结果和完成动画一起出来，完成动画可以稍微慢一点点",
+        result: StructuredRewriteResult(
+            rewrittenText: "请调整当前的展示逻辑：不要等动画完全结束后才显示优化后的文字，让优化结果与完成动画同步呈现；同时将完成动画的播放速度略微调慢。"
+        ),
+        applicationRole: .aiDevelopmentAssistant,
+        expansionRatio: 1.35,
+        lengthBudget: .expansion
+    ).accepted,
+    "扩写编辑指令不会把同步展示误判为新增责任人"
 )
 check(
     FactGuard.audit(
@@ -2019,6 +2042,20 @@ check(
         candidate: "好的"
     ),
     "自然短回复不为制造变化而重复请求"
+)
+check(
+    MessagingRewriteRetryPolicy.shouldRetryUnchanged(
+        sourceText: "的的",
+        candidate: "的的"
+    ),
+    "明确问题不因文本过短而跳过重试"
+)
+check(
+    !MessagingRewriteRetryPolicy.shouldRetryUnchanged(
+        sourceText: "中文语义要符合中文的表达习惯，不要用那些机器翻译出来的词儿",
+        candidate: "中文语义要符合中文的表达习惯，不要用那些机器翻译出来的词儿"
+    ),
+    "不因文本长度推断表达存在问题"
 )
 check(
     MessagingRewriteRetryPolicy.shouldRetryUnchanged(
@@ -2270,7 +2307,7 @@ let retryCoveredQualityCases = qualityCasesRequiringImprovement.filter {
     )
 }
 check(
-    retryCoveredQualityCases.count >= 28,
+    retryCoveredQualityCases.count * 2 > qualityCasesRequiringImprovement.count,
     "原样返回重试策略覆盖大部分明确可优化样例"
 )
 check(

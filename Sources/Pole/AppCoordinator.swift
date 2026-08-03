@@ -51,8 +51,6 @@ package final class AppCoordinator: NSObject, NSMenuDelegate {
     }
 
     private struct PendingCompletion {
-        let context: CapturedTextContext
-        let cursorUTF16: Int
         let outcome: OptimizationOutcome
         let action: RewriteAction
         let retried: Bool
@@ -122,6 +120,9 @@ package final class AppCoordinator: NSObject, NSMenuDelegate {
         }
         monitor.onTrigger = { [weak self] side in
             self?.handleTrigger(side == .right ? .translate : .polish)
+        }
+        monitor.onExpand = { [weak self] in
+            self?.handleTrigger(.expand)
         }
 
         NotificationCenter.default.addObserver(
@@ -321,7 +322,7 @@ package final class AppCoordinator: NSObject, NSMenuDelegate {
     }
 
     private var readyStatusText: String {
-        "左 Option 润色 · 右 Option 翻译"
+        "左 Option 润色 · 右 Option 翻译 · 双 Option 扩写"
     }
 
     private var buildDescription: String {
@@ -945,9 +946,6 @@ package final class AppCoordinator: NSObject, NSMenuDelegate {
            !adaptivePolishPlan.shouldRequestModel {
             recentRewriteFeedbackContext = nil
             pendingCompletion = PendingCompletion(
-                context: context,
-                cursorUTF16: context.replacementRange.location
-                    + (context.sourceText as NSString).length,
                 outcome: .unchanged,
                 action: action,
                 retried: false,
@@ -1092,6 +1090,10 @@ package final class AppCoordinator: NSObject, NSMenuDelegate {
                         stage: .firstModel
                     )
                 }
+                let outcome = OptimizationOutcome.classify(
+                    sourceText: context.sourceText,
+                    result: result
+                )
                 let writebackStartedAt = RewritePerformanceTrace.timestamp()
                 try await MainActor.run {
                     guard self.rewriteCoordinator.isCurrent(requestID) else {
@@ -1110,10 +1112,6 @@ package final class AppCoordinator: NSObject, NSMenuDelegate {
                     guard self.rewriteCoordinator.isCurrent(requestID) else {
                         throw CancellationError()
                     }
-                    let outcome = OptimizationOutcome.classify(
-                        sourceText: context.sourceText,
-                        result: result
-                    )
                     if action == .polish {
                         let relationshipID = communicationContext?.relationship?.id
                         let historyEntryID: UUID?
@@ -1135,11 +1133,7 @@ package final class AppCoordinator: NSObject, NSMenuDelegate {
                             createdAt: Date()
                         )
                     }
-                    let finalCursorUTF16 = context.replacementRange.location
-                        + (result as NSString).length
-                    self.pendingCompletion = PendingCompletion(
-                        context: context,
-                        cursorUTF16: finalCursorUTF16,
+                    let completion = PendingCompletion(
                         outcome: outcome,
                         action: action,
                         retried: attemptState.retried,
@@ -1149,12 +1143,12 @@ package final class AppCoordinator: NSObject, NSMenuDelegate {
                         .writeback,
                         since: writebackStartedAt
                     )
-                    self.perform(
-                        #selector(self.finishPendingCompletion),
-                        with: nil,
-                        afterDelay: 0.08
-                    )
+                    self.completeRewrite(completion)
                 }
+                await self.waitForResultAnimation(
+                    outcome: outcome,
+                    operation: action.progressOperation
+                )
             } catch {
                 await MainActor.run {
                     if error is CancellationError
@@ -1301,28 +1295,40 @@ package final class AppCoordinator: NSObject, NSMenuDelegate {
         pendingCompletion = nil
         progressPositionRetryWorkItem?.cancel()
         progressPositionRetryWorkItem = nil
-        inputProgressIndicator.move(
-            to: textService.insertionPointScreenRect(
-                for: completion.context,
-                cursorUTF16: completion.cursorUTF16
-            )
-        ) { [weak self] in
-            guard let self, self.model.isProcessing else { return }
-            self.inputProgressIndicator.finish(
-                with: completion.outcome,
-                operation: completion.action.progressOperation
-            )
-            let outcome = completion.outcome == .unchanged ? "unchanged" : "changed"
-            self.activePerformanceTrace?.finish(
-                outcome: outcome,
-                retried: completion.retried,
-                retryReason: completion.retryReason
-            )
-            self.activePerformanceTrace = nil
-            self.rewriteCoordinator.finish()
-            self.model.isProcessing = false
-            self.model.statusText = self.model.isEnabled ? self.readyStatusText : "已暂停"
+        completeRewrite(completion)
+        inputProgressIndicator.finish(
+            with: completion.outcome,
+            operation: completion.action.progressOperation
+        )
+    }
+
+    private func waitForResultAnimation(
+        outcome: OptimizationOutcome,
+        operation: InputProgressOperation
+    ) async {
+        progressPositionRetryWorkItem?.cancel()
+        progressPositionRetryWorkItem = nil
+        await withCheckedContinuation { continuation in
+            inputProgressIndicator.finish(
+                with: outcome,
+                operation: operation
+            ) {
+                continuation.resume()
+            }
         }
+    }
+
+    private func completeRewrite(_ completion: PendingCompletion) {
+        let outcome = completion.outcome == .unchanged ? "unchanged" : "changed"
+        activePerformanceTrace?.finish(
+            outcome: outcome,
+            retried: completion.retried,
+            retryReason: completion.retryReason
+        )
+        activePerformanceTrace = nil
+        rewriteCoordinator.finish()
+        model.isProcessing = false
+        model.statusText = model.isEnabled ? readyStatusText : "已暂停"
     }
 
     private func showError(_ message: String) {
